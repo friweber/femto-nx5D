@@ -9,6 +9,7 @@ Auswertung von Messungen an der FemtoMAX-Beamline (MAX IV): Sardana-Scans (`scan
 | `femto_nx5d.figures` | Abbildungen im Paper-Stil: Linien, Karten mit/ohne Konturen, Wasserfall, Peak-Spur, Wiederholungen, Meta-Plots vs. Fluenz und Temperatur, Insets |
 | `femto_nx5d.feb` | Profil-Auswertung ohne nx5d: Suchpfade für Rohdaten und vorverarbeitete Profile, ROI-Leser (blockweise statt ganzer Pilatus-Stapel im Speicher), Status-Tabelle |
 | `femto_nx5d.notebooks` | Notebook-Vorlage pro Probe für die nx5d-Pipeline |
+| `femto_nx5d.scan_table` | kompakte Scan-Tabelle aller Master-Dateien (nur Skalare, ohne Bilder): `python -m femto_nx5d.scan_table <raw> <ziel>` |
 
 ## Installation
 
