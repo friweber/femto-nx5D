@@ -46,8 +46,9 @@ femto-nx5d setup-feb --raw <rohdaten-ordner> --out .
 ```
 
 legt `femtomax_config.json`, ein `<Set>_analysis.ipynb` pro Proben-Set und `Alle_Proben.ipynb` an.
-- Die Proben-Sets kommen aus den Scanlisten `measurement_file_<Set>.txt` (gesucht unter `Eval*/…/scan_files`
-  oder `--scan-files`).
+- Die Proben-Sets sind standardmäßig die korrigierten Scanlisten der 8 Paper-Proben bei 400 nm
+  (`femto_nx5d/data/feb2025_scan_lists.json`). Eigene Listen `measurement_file_<Set>.txt` haben Vorrang
+  (`--scan-files`, `<out>/scan_files`, `--search-share`).
 - Die RSM-Scans kommen aus `which_sample.csv`.
 - Die Geometrie je Scan (Mittelpixel, Austrittswinkel) wird aus den vorhandenen `process/scan-N_roi_profile.nc`
   gelesen, damit die q-Skala der bisherigen Auswertung erhalten bleibt.

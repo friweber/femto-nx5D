@@ -222,10 +222,12 @@ Zeitnullpunkt, Fitfenster oder Peaks ändern: in `femtomax_config.json` unter `s
     md("## 1 Scans")
     code("""cat = fmx.catalog(cfg)          # beim ersten Mal einige Minuten (liest alle Master-Dateien), danach catalog.csv
 display(fmx.set_overview(cfg, SET))
-print("Peaks:", {l: (p["element"], p["group"], p["qz"]) for l, p in cfg["sets"][SET]["peaks"].items()})""")
+print("Peaks:", {l: (p["element"], p["group"], p["qz"]) for l, p in cfg["sets"][SET]["peaks"].items()})
+for note in cfg["sets"][SET].get("notes", []):
+    print("Hinweis Scanliste:", note)""")
     md("## 2 Ingest (Hintergrund)")
     code("""JOBS = 6                 # parallele Prozesse (der Hub hat 8 Kerne)
-START_INGEST = True
+START_INGEST = False     # normalerweise wandelt Alle_Proben.ipynb alle Paper-Scans um; nur für dieses Set: True
 
 order = fmx.ingest_order(cat, SET, cfg=cfg)
 print(f"{len(order)} Scans, {cat['pilatus_GB'].reindex(order).sum():.0f} GB Rohdaten")
@@ -270,6 +272,18 @@ for l in [l for l in res if not l.startswith("_")]:
     ff.fig_set_profiles(res[l], ax=ax[2])
     ff.save(fig, f"{SET}_{l.replace('@', '_at_')}_detail", FIG)
     plt.show()""")
+    code("""# Zusätzliche Scans (Gruppe <X>_zusatz, nicht in den ursprünglichen Listen) mit der Hauptgruppe vergleichen;
+# passen sie, können sie in femtomax_config.json in die Hauptgruppe übernommen werden
+extra = [g for g in cfg["sets"][SET]["groups"] if g.endswith("_zusatz")]
+for g in extra:
+    base = g.split("_")[0]
+    labels = [l for l in (base, f"{base}@{g}") if l in res]
+    if len(labels) == 2:
+        fig, ax = plt.subplots(1, 2, figsize=(ff.COL2, 2.3), constrained_layout=True)
+        ff.fig_set_lines(res, "lang", var="strain", ax=ax[0], labels=labels, title=f"{base}: Liste vs. Zusatz")
+        ff.fig_set_lines(res, "kurz", var="strain", ax=ax[1], labels=labels)
+        ff.save(fig, f"{SET}_{g}_vergleich", FIG)
+        plt.show()""")
     code("""# Export im Format von Eval_by_Project/3. NiAu/data_export (für die Paper-Skripte)
 if [l for l in res if not l.startswith("_")]:
     for d in fmx.export_set(res, cfg, SET, RESULTS / "paper_export"):

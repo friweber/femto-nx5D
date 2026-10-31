@@ -3,10 +3,13 @@ Config und Notebooks für die FemtoMAX-Strahlzeit Feb 2025 (Schichtproben, ein P
 
     femto-nx5d setup-feb --raw <rohdaten-ordner> --out <arbeitsordner> [--scan-files <ordner>]
 
-- Proben-Sets kommen aus den Scanlisten `measurement_file_<Set>.txt` (Spalten: Scan, Probe,
-  Scantyp, Frames, Wellenlänge, Winkel, Leistung). Der Scantyp legt die Gruppe fest
-  (0 = Au-Winkel, 1 = Ni-Winkel, 3 = Cu-Winkel, 2 = weitere Au-Winkel-Scans, ohne Standard-Fit).
-- Gesucht wird in --scan-files, <out>/scan_files und unter dem Strahlzeit-Ordner (Eval*/…/scan_files).
+- Proben-Sets: standardmäßig die korrigierten Scanlisten der 8 Paper-Proben (400 nm) aus dem Paket
+  (femto_nx5d/data/feb2025_scan_lists.json: Scans an falscher Probenposition umsortiert, zusätzliche
+  vollständige Scans als eigene Gruppe). Eigene Listen `measurement_file_<Set>.txt` (Spalten: Scan,
+  Probe, Scantyp, Frames, Wellenlänge, Winkel, Leistung) haben Vorrang: --scan-files oder
+  <out>/scan_files; --search-share sucht sie unter dem Strahlzeit-Ordner (Eval*/…/scan_files).
+  Scantyp -> Gruppe: 0 = Au-Winkel, 1 = Ni-Winkel, 3 = Cu-Winkel, 2 = Scans einer anderen Probe
+  (ohne Fit), 10/11/13 = zusätzliche Scans am Au-/Ni-/Cu-Winkel (Gruppe "<X>_zusatz", getrennt gefittet).
 - RSM-Scans (e_gon01_keta) pro Probe über which_sample.csv neben dem Rohdaten-Ordner.
 - Geometrie wie in der bisherigen Profil-Auswertung (2_1_preprocess_profiles): Detektor um 90°
   gedreht, a_in = |keta + 30.7|, a_out = Austrittswinkel + atan((x - Mittelpixel) 0.172/450)
@@ -26,17 +29,39 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-SCANTYPE_GROUP = {0: "Au", 1: "Ni", 2: "Typ2", 3: "Cu"}
+SCANTYPE_GROUP = {0: "Au", 1: "Ni", 2: "Typ2", 3: "Cu", 10: "Au_zusatz", 11: "Ni_zusatz", 13: "Cu_zusatz"}
 # q_z (1/Å) on the scale of the earlier evaluation (λ = 1.5498 Å) and fit half width
 PEAKS = {"Au": (2.64, 0.07), "Ni": (3.04, 0.06), "Cu": (2.97, 0.07)}
 
 
-def find_scan_files(raw, out, given=None, max_depth=5):
+def builtin_scan_lists():
+    """Corrected scan lists shipped with the package -> ({set: array like read_scan_files}, {set: notes})."""
+    from importlib import resources
+    data = json.loads(resources.files("femto_nx5d").joinpath("data/feb2025_scan_lists.json").read_text(encoding="utf-8"))
+    sets, notes = {}, {}
+    for name, st in data["sets"].items():
+        a = np.full((len(st["rows"]), 7), np.nan)
+        for i, (scan, t, ang) in enumerate(st["rows"]):
+            a[i, 0], a[i, 2], a[i, 4], a[i, 5] = scan, t, data.get("pump_wavelength_nm", np.nan), ang
+        sets[name], notes[name] = a, st.get("notes", [])
+    return sets, notes
+
+
+def builtin_geometry():
+    """Per-scan [center_pixel, exit_angle] of the earlier evaluation, shipped with the package."""
+    from importlib import resources
+    data = json.loads(resources.files("femto_nx5d").joinpath("data/feb2025_scan_lists.json").read_text(encoding="utf-8"))
+    return data.get("scan_geometry", {})
+
+
+def find_scan_files(raw, out, given=None, max_depth=5, search=False):
     cands = [Path(given)] if given else []
     cands.append(Path(out) / "scan_files")
     for c in cands:
         if c.is_dir() and list(c.glob("measurement_file_*.txt")):
             return c
+    if not search:
+        return None
     base = Path(raw).resolve().parent.parent          # .../<proposal>/<visit>
     found = []
     for root, dirs, files in os.walk(base):
@@ -131,12 +156,24 @@ def old_geometry(process, scans):
     return out
 
 
-def build_config(raw, out, sets, process=None):
+def build_config(raw, out, sets, process=None, notes=None, paper=None):
     raw, out = Path(raw).resolve(), Path(out).resolve()
     ranges = _which_sample(raw)
     all_scans = sorted({int(s) for a in sets.values() for s in a[:, 0]})
     proc = find_process(raw, process)
-    scan_geo = old_geometry(proc, all_scans) if proc else {}
+    scan_geo = {k: v for k, v in builtin_geometry().items() if int(k) in all_scans}
+    if proc:
+        scan_geo.update(old_geometry(proc, all_scans))
+    # plausibility: 2theta at pixel 800 (a_in + exit angle + pixel angle) within 1 deg of the lab geometry
+    keta_of = {int(r[0]): float(r[5]) for a in sets.values() for r in a}
+    tth_lab = TWO_THETA_LAB + np.degrees(np.arctan((800 - 670) * PX / DIST))
+    rejected = []
+    for k in list(scan_geo):
+        c, det = scan_geo[k]
+        tth = (-keta_of.get(int(k), np.nan) - 30.7) + det + np.degrees(np.arctan((800 - c) * PX / DIST))
+        if not abs(tth - tth_lab) <= 1.0:
+            rejected.append(int(k))
+            del scan_geo[k]
     cfg_sets = {}
     for name, a in sets.items():
         groups = {}
@@ -146,23 +183,34 @@ def build_config(raw, out, sets, process=None):
         elements = [e for e in ("Au", layer) if e]
         peaks = {}
         for g in groups:
-            if g not in PEAKS:
+            base = g.split("_")[0]
+            if base not in PEAKS:
                 continue                       # e.g. Typ2: no default fit
-            for e in [g] + [x for x in elements if x != g]:
+            for e in [base] + [x for x in elements if x != base]:
                 q, hw = PEAKS[e]
                 peaks[e if e == g else f"{e}@{g}"] = {"element": e, "group": g, "qz": q, "halfwidth": hw}
         wl = name.rsplit("_", 1)[-1]
         geometry = {}
-        for g, scans in groups.items():
+        for g in sorted(groups, key=lambda g: "_" in g):          # base groups first
+            scans = groups[g]
             known = [scan_geo[str(s)] for s in scans if str(s) in scan_geo]
             if known:
                 geometry[g] = [float(np.median([k[0] for k in known])), float(np.median([k[1] for k in known]))]
+            elif g.split("_")[0] in geometry:                     # extra scans: like their base group
+                geometry[g] = list(geometry[g.split("_")[0]])
             else:     # detector fixed in the lab, exit angle at pixel 670 = 2theta - a_in
                 keta = float(np.median(a[np.isin(a[:, 0], scans), 5]))
                 geometry[g] = [670.0, round(TWO_THETA_LAB - (-keta - 30.7), 4)]
+        set_notes = list((notes or {}).get(name, []))
+        for g, scans in groups.items():
+            bad = [x for x in scans if x in rejected]
+            if bad:
+                set_notes.append(f"{g}: alte Geometrie von {bad} unplausibel (2θ > 1° neben der Laborgeometrie) "
+                                 f"-> Gruppenwert {geometry[g]}")
         cfg_sets[name] = {"groups": groups, "peaks": peaks, "rsm_scans": rsm_scans(raw, name, ranges),
-                          "geometry": geometry, "delay_offset": 0.0, "paper": wl == "400",
-                          "pump_wavelength_nm": wl}
+                          "geometry": geometry, "delay_offset": 0.0,
+                          "paper": (wl == "400") if paper is None else paper,
+                          "pump_wavelength_nm": wl, "notes": set_notes}
     prop = raw.name                             # e.g. "NiAu" (collection name)
     return {
         "_comment": "FemtoMAX Feb 2025 (femto_nx5d.feb_setup). Geometrie wie in 2_1_preprocess_profiles. "
@@ -195,7 +243,7 @@ def build_config(raw, out, sets, process=None):
         "use_scan_geometry": True,
         "old_pixel_to_roi": 1000,
         "_scan_geometry_comment": "[Mittelpixel, Austrittswinkel] je Scan wie in 2_1_preprocess_profiles "
-                                  "(Pixel des gedrehten Bildes); aus " + (str(proc) if proc else "- (keine process-Dateien)"),
+                                  "(Pixel des gedrehten Bildes); aus dem Paket" + (f" und {proc}" if proc else ""),
         "scan_geometry": scan_geo,
         "delay_bins_ps": [[-5, 50, 0.5], [50, 200, 1.0]],
         "strain_ref_ps": [-5, 0],
@@ -230,16 +278,22 @@ def main(argv=None):
     ap.add_argument("--out", default=".", help="Arbeitsordner (Config, Notebooks, Ergebnisse)")
     ap.add_argument("--scan-files", help="Ordner mit measurement_file_<Set>.txt")
     ap.add_argument("--process", help="Ordner mit den bisherigen scan-N_roi_profile.nc (Geometrie je Scan)")
+    ap.add_argument("--search-share", action="store_true",
+                    help="eigene Scanlisten unter dem Strahlzeit-Ordner (Eval*/…/scan_files) suchen")
     ap.add_argument("--force", action="store_true", help="vorhandene Config/Notebooks überschreiben")
     a = ap.parse_args(argv)
-    d = find_scan_files(a.raw, a.out, a.scan_files)
+    d = find_scan_files(a.raw, a.out, a.scan_files, search=a.search_share)
     if d is None:
-        raise SystemExit("Keine Scanlisten (measurement_file_<Set>.txt) gefunden. Den Ordner scan_files "
-                         f"nach {Path(a.out).resolve() / 'scan_files'} kopieren oder --scan-files angeben.")
-    sets = read_scan_files(d)
-    print(f"Scanlisten: {d} ({len(sets)} Sets)")
-    cfg = build_config(a.raw, a.out, sets, a.process)
-    print(f"Geometrie je Scan aus bisherigen Profilen: {len(cfg['scan_geometry'])} Scans"
+        sets, notes = builtin_scan_lists()
+        print(f"Scanlisten: korrigierte Paper-Listen aus dem Paket ({len(sets)} Sets, 400 nm)")
+        for n, ns in notes.items():
+            for x in ns:
+                print(f"  {n}: {x}")
+    else:
+        sets, notes = read_scan_files(d), {}
+        print(f"Scanlisten: {d} ({len(sets)} Sets)")
+    cfg = build_config(a.raw, a.out, sets, a.process, notes)
+    print(f"Geometrie je Scan wie in der bisherigen Auswertung: {len(cfg['scan_geometry'])} Scans"
           + ("" if cfg["scan_geometry"] else " (keine gefunden -> Labor-Geometrie)"))
     for n, st in cfg["sets"].items():
         print(f"  {n:16s} Gruppen {', '.join(f'{g} ({len(v)})' for g, v in st['groups'].items())}; "
