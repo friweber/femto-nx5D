@@ -1418,9 +1418,41 @@ def _loop_curve(proposal, scans, cfg, qz_center, qx_qy_zero=True, min_frames=5, 
             "dropped": dropped, "scans": list(scans), **fit}
 
 
+def _xcorr_shift(qg, ref, y, mask, max_shift, n=201):
+    """
+    Shift s (1/A) that moves profile y onto ref: y(q - s) ~ ref(q), by maximising the normalised
+    overlap of the background-subtracted profiles inside `mask`, |s| <= max_shift, parabolic refine.
+    Returns (s, ok); ok is False if the optimum lies at the limit or there are too few points.
+    """
+    ok_y = np.isfinite(y)
+    if mask.sum() < 5 or ok_y.sum() < 5 or not np.isfinite(ref[mask]).any():
+        return 0.0, False
+    q = qg[mask]
+    fr = np.isfinite(ref[mask])
+    qq = np.linspace(q.min(), q.max(), 400)
+    rr = np.interp(qq, q[fr], (ref[mask] - np.nanmin(ref[mask]))[fr])
+    base = np.nanmin(y[mask]) if np.isfinite(y[mask]).any() else np.nanmin(y)
+    shifts = np.linspace(-max_shift, max_shift, n)
+    c = np.full(n, np.nan)
+    for i, sft in enumerate(shifts):
+        ys = np.interp(qq, qg[ok_y] + sft, y[ok_y] - base, left=np.nan, right=np.nan)
+        v = np.isfinite(ys)
+        if v.sum() > 0.8 * qq.size:
+            den = np.sqrt((rr[v] ** 2).sum() * (ys[v] ** 2).sum())
+            c[i] = (rr[v] * ys[v]).sum() / den if den > 0 else np.nan
+    if not np.isfinite(c).any():
+        return 0.0, False
+    i = int(np.nanargmax(c))
+    if i in (0, n - 1) or not np.isfinite(c[i - 1]) or not np.isfinite(c[i + 1]):
+        return float(shifts[i]), False
+    den = c[i - 1] - 2 * c[i] + c[i + 1]
+    frac = 0.5 * (c[i - 1] - c[i + 1]) / den if den != 0 else 0.0
+    return float(shifts[i] + frac * (shifts[1] - shifts[0])), True
+
+
 def _merged_curve(proposal, scans, cfg, qz_center=None, drift_correction=True, min_frames=5,
                   delay_tol_ps=3.0, halfwidth=None, delay_offset=0.0, delay_bins=None, full_profiles=False,
-                  overrides=None):
+                  overrides=None, fixed_shift_rel=None):
     """
     loop_mode "merge" (Feb 2025: every scan is one full delay sweep with ~10 frames per delay):
     the peak position before t0 is determined per scan from its averaged pre-t0 profile, every
@@ -1439,31 +1471,70 @@ def _merged_curve(proposal, scans, cfg, qz_center=None, drift_correction=True, m
         sp = L["spice"]
         dl = L["delay"] + ((sp.get("offsets") or {}).get("delay") or 0.0) + (delay_offset or 0.0)
         per.append({"scan": s, "delay": dl, "prof": L["prof"], "qz": L["qz"], "colp": L["colp"],
-                    "qy": L["qy"], "dropped": L["dropped"]})
+                    "qy": L["qy"], "dropped": L["dropped"],
+                    "k": 2 * np.pi / (12398.42 / sp["exp_info"]["beamEnergy"])})
     if not per:
         return None
     qg = per[0]["qz"]
     if qz_center is not None and not (np.nanmin(qg) <= qz_center <= np.nanmax(qg)):
         return None
-    # pre-t0 peak position per scan
+    # drift per scan: shift of its pre-t0 profile against the mean pre-t0 profile of all scans
+    # (cross-correlation in the peak window, |shift| <= max_drift_permille). fixed_shift_rel: relative
+    # shifts taken from the main peak of the same scans (weak peaks, peaks at the detector edge).
+    pre_g = []
     for d in per:
         pre = (d["delay"] >= ref[0]) & (d["delay"] <= ref[1])
-        d["q0"] = np.nan
-        if pre.sum() >= min_frames:
+        with np.errstate(all="ignore"):
+            m = np.nanmean(d["prof"][pre], axis=0) if pre.any() else np.full(d["qz"].size, np.nan)
+        pre_g.append(np.interp(qg, d["qz"], m, left=np.nan, right=np.nan))
+    pre_g = np.array(pre_g)
+    with np.errstate(all="ignore"):
+        mref = np.nanmean(pre_g, axis=0)
+    if not np.isfinite(mref).any():
+        return None
+    centre = qz_center if qz_center is not None else qg[np.nanargmax(mref)]
+    win = (np.abs(qg - centre) <= 2 * hw) & np.isfinite(mref)
+    if win.sum() < 5:
+        return None
+    qw0 = qg[win][np.nanargmax(mref[win])]
+    f0 = fit_profiles(qg, mref[None, :], qw0, hw)
+    q_ref = f0["center"][0] if np.isfinite(f0["center"][0]) else (f0["com"][0] if np.isfinite(f0["com"][0]) else qw0)
+    xwin = (np.abs(qg - qw0) <= 2 * hw) & np.isfinite(mref)
+    max_shift = cfg.get("max_drift_permille", 5.0) * 1e-3 * q_ref
+    k = per[0]["k"]
+    dq_dangle = 2 * k * np.sqrt(max(1 - (q_ref / (2 * k)) ** 2, 1e-6))    # dq/dtheta at this peak
+    flagged = []
+    for d in per:
+        d["shift"] = 0.0
+    if drift_correction and fixed_shift_rel is not None:
+        # same angular offset as the main peak of these scans: dq = 2k cos(theta) dtheta
+        for d in per:
+            r = fixed_shift_rel.get(int(d["scan"]))
+            d["shift"] = float(r) * dq_dangle if r is not None and np.isfinite(r) else 0.0
+    elif drift_correction:
+        refp = mref
+        for _ in range(2):
+            oks = []
+            for d, pg in zip(per, pre_g):
+                sft, ok_ = _xcorr_shift(qg, refp, pg, xwin, max_shift)
+                d["shift"] = sft if ok_ else 0.0
+                oks.append(ok_)
+            good = [d["shift"] for d, o in zip(per, oks) if o]
+            mean_shift = float(np.mean(good)) if good else 0.0
+            for d, o in zip(per, oks):
+                if o:
+                    d["shift"] -= mean_shift            # no net shift of the q scale
             with np.errstate(all="ignore"):
-                m = np.nanmean(d["prof"][pre], axis=0)
-            win = (np.abs(d["qz"] - (qz_center if qz_center is not None else d["qz"][np.nanargmax(m)])) <= 2 * hw) & np.isfinite(m)
-            if win.any():
-                qw = d["qz"][win][np.nanargmax(m[win])]
-                f = fit_profiles(d["qz"], m[None, :], qw, hw)
-                d["q0"] = f["center"][0] if np.isfinite(f["center"][0]) else f["com"][0]
+                refp = np.nanmean([np.interp(qg, qg + d["shift"], pg, left=np.nan, right=np.nan)
+                                   for d, pg in zip(per, pre_g)], axis=0)
+        flagged = [d["scan"] for d, o in zip(per, oks) if not o]
+    for d in per:
+        d["q0"] = q_ref - d["shift"]
     q0s = np.array([d["q0"] for d in per])
-    q_ref = np.nanmean(q0s) if np.isfinite(q0s).any() else np.nan
     # shift and merge
     D, P, C = [], [], []
     for d in per:
-        shift = (q_ref - d["q0"]) if (drift_correction and np.isfinite(d["q0"])) else 0.0
-        d["shift"] = shift
+        shift = d["shift"]
         P.append(np.array([np.interp(qg, d["qz"] + shift, x, left=np.nan, right=np.nan) for x in d["prof"]]))
         D.append(d["delay"])
         C.append(d["colp"])
@@ -1517,13 +1588,14 @@ def _merged_curve(proposal, scans, cfg, qz_center=None, drift_correction=True, m
         win = np.abs(d["qz"] - (qw - d["shift"])) <= hw
         for j, b in enumerate(keep):
             fr = np.where(ok2 & (i2 == b))[0]
-            if fr.size:
+            if fr.size and win.sum() >= 3:
                 with np.errstate(all="ignore"):
                     y = np.nanmean(d["prof"][fr][:, win], axis=0)
                 yy = np.clip(y - np.nanmin(y), 0, None)
                 if np.nansum(yy) > 0:
                     cur[j] = np.nansum(yy * d["qz"][win]) / np.nansum(yy)
-        r0 = np.nanmean(cur[(bd >= ref[0]) & (bd <= ref[1])])
+        with np.errstate(all="ignore"):
+            r0 = np.nanmean(cur[(bd >= ref[0]) & (bd <= ref[1])])
         sl.append(-(cur - r0) / r0 * 1e3)
     ds["strain_loop"] = (("loop", "delay"), np.array(sl))
     ds = ds.assign_coords(loop=np.arange(len(per)), loop_scan=("loop", [d["scan"] for d in per]))
@@ -1534,6 +1606,9 @@ def _merged_curve(proposal, scans, cfg, qz_center=None, drift_correction=True, m
         ds["intensity_full"] = (("delay", "qz"), Pb)
         ds = ds.assign_coords(qz=qg)
     ds.attrs.update({"loops": [f"{d['scan']}: q0={d['q0']:.4f}" for d in per], "q_ref": float(q_ref),
+                     "scan_shift_angle": json.dumps({str(d["scan"]): d["shift"] / dq_dangle for d in per}),
+                     "drift_flagged": json.dumps([int(x) for x in flagged]),
+                     "drift_source": "fixed" if fixed_shift_rel is not None else "xcorr",
                      "q_window": float(qw), "drift_corrected": bool(drift_correction), "loop_mode": "merge",
                      "dropped_frames": int(sum(d["dropped"] for d in per)),
                      "drift_permille": float((np.nanmax(q0s) - np.nanmin(q0s)) / q_ref * 1e3)
@@ -1543,7 +1618,7 @@ def _merged_curve(proposal, scans, cfg, qz_center=None, drift_correction=True, m
 
 def analyze_curve(proposal, scans, cfg, qz_center=None, qx_qy_zero=True, drift_correction=True,
                   min_frames=5, delay_tol_ps=3.0, halfwidth=None, delay_offset=0.0,
-                  delay_bins=None, full_profiles=False, loop_mode=None, overrides=None):
+                  delay_bins=None, full_profiles=False, loop_mode=None, overrides=None, fixed_shift_rel=None):
     """
     One curve (e.g. one fluence) from several scans: the scans are split into
     loops (repetitions), every loop is binned and fitted on its own, shifted
@@ -1562,7 +1637,7 @@ def analyze_curve(proposal, scans, cfg, qz_center=None, qx_qy_zero=True, drift_c
     mode = loop_mode or cfg.get("loop_mode", "consecutive")
     if mode == "merge":
         return _merged_curve(proposal, scans, cfg, qz_center, drift_correction, min_frames, delay_tol_ps,
-                             halfwidth, delay_offset, delay_bins, full_profiles, overrides)
+                             halfwidth, delay_offset, delay_bins, full_profiles, overrides, fixed_shift_rel)
     groups = [[int(s)] for s in sorted(scans)] if mode == "scan" else split_loops(scans)
     loops = [l for l in (_loop_curve(proposal, lp, cfg, qz_center, qx_qy_zero, min_frames, delay_tol_ps,
                                      halfwidth, delay_offset, delay_bins, overrides)
@@ -1802,8 +1877,11 @@ def analyze_set(proposal, cfg, name, peaks=None, **kw):
     st = cfg["sets"][name]
     out, log = {}, []
     have = set(proposal.all())
-    for label, pk in st["peaks"].items():
-        if peaks and label not in peaks:
+    main_of = lambda pk: pk["element"] == pk["group"].split("_")[0]
+    order = sorted(st["peaks"].items(), key=lambda kv: not main_of(kv[1]))      # main peaks first
+    group_shift = {}
+    for label, pk in order:
+        if peaks and label not in peaks and not main_of(pk):
             continue
         group = st["groups"][pk["group"]]
         scans = [s for s in group if str(int(s)) in have]
@@ -1811,9 +1889,18 @@ def analyze_set(proposal, cfg, name, peaks=None, **kw):
             print(f"{name} {label}: noch keiner der {len(group)} Scans umgewandelt", flush=True)
             continue
         ov = {int(s): scan_geometry(cfg, s, name, pk["group"]) for s in scans}
-        ds = analyze_curve(proposal, scans, cfg, qz_center=pk["qz"], halfwidth=pk.get("halfwidth"),
-                           delay_offset=st.get("delay_offset", 0.0), delay_bins=st.get("delay_bins_ps"),
-                           overrides={s: o for s, o in ov.items() if o}, **kw)
+        fixed = None if main_of(pk) else group_shift.get(pk["group"])
+        try:
+            ds = analyze_curve(proposal, scans, cfg, qz_center=pk["qz"], halfwidth=pk.get("halfwidth"),
+                               delay_offset=st.get("delay_offset", 0.0), delay_bins=st.get("delay_bins_ps"),
+                               overrides={s: o for s, o in ov.items() if o}, fixed_shift_rel=fixed, **kw)
+        except Exception as e:                 # one bad peak must not stop the whole series
+            import traceback
+            logger.warning(traceback.format_exc())
+            print(f"{name} {label}: FEHLER {type(e).__name__}: {e} (übersprungen)", flush=True)
+            continue
+        if ds is not None and main_of(pk) and "scan_shift_angle" in ds.attrs:
+            group_shift[pk["group"]] = {int(k): v for k, v in json.loads(ds.attrs["scan_shift_angle"]).items()}
         if ds is None:
             print(f"{name} {label}: Peak nicht im Messbereich dieser Scans", flush=True)
             continue
@@ -1824,11 +1911,15 @@ def analyze_set(proposal, cfg, name, peaks=None, **kw):
         log.append({"Peak": label, "Scans": f"{len(scans)}/{len(group)}", "Wiederholungen": len(ds.attrs["loops"]),
                     "Drift ‰": round(ds.attrs["drift_permille"], 2), "verworfene Frames": ds.attrs["dropped_frames"],
                     "q0 (1/Å)": round(ds.attrs["q_ref"], 4), "max |Dehnung| ‰": round(mx, 2)})
-        print(f"{name} {label}: {len(scans)}/{len(group)} Scans, Drift {ds.attrs['drift_permille']:.2f} ‰, "
-              f"{ds.attrs['dropped_frames']} Frames verworfen, max |Dehnung| {mx:.2f} ‰", flush=True)
+        flag = json.loads(ds.attrs.get("drift_flagged", "[]"))
+        src = " (Drift vom Hauptpeak)" if ds.attrs.get("drift_source") == "fixed" else ""
+        print(f"{name} {label}: {len(scans)}/{len(group)} Scans, Drift {ds.attrs['drift_permille']:.2f} ‰{src}, "
+              f"{ds.attrs['dropped_frames']} Frames verworfen, max |Dehnung| {mx:.2f} ‰"
+              + (f"; Drift nicht bestimmbar (nicht verschoben): {flag}" if flag else ""), flush=True)
+    out = {l: out[l] for l in st["peaks"] if l in out}
     if log:
         import pandas as pd
-        out["_log"] = pd.DataFrame(log).set_index("Peak")
+        out["_log"] = pd.DataFrame(log).set_index("Peak").reindex([l for l in st["peaks"] if l in out])
     return out
 
 
