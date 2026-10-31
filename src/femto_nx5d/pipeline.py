@@ -884,7 +884,10 @@ def strain(peaks, ref=None, key="center", dim=None):
     '''
     q = peaks[key]
     dim = dim or q.dims[0]
-    first = q.dropna(dim).isel({dim: 0})
+    valid = q.dropna(dim)
+    if valid.sizes[dim] == 0:                  # no valid point at all (e.g. every fit failed)
+        return q * np.nan
+    first = valid.isel({dim: 0})
     if ref is None:
         q0 = first
     elif np.isscalar(ref):
@@ -1418,6 +1421,25 @@ def _loop_curve(proposal, scans, cfg, qz_center, qx_qy_zero=True, min_frames=5, 
             "dropped": dropped, "scans": list(scans), **fit}
 
 
+def _find_peak(qg, prof, centre, hw, factor=1.5):
+    """
+    Position of a real maximum of `prof` within centre +- factor*hw, or None: the maximum must not lie at
+    the border of the search range (a rising flank of a neighbouring peak) and must stand out from the
+    straight line between the two ends of the range by at least 20 % of the range of values.
+    """
+    sel = np.where((np.abs(qg - centre) <= factor * hw) & np.isfinite(prof))[0]
+    if sel.size < 7:
+        return None
+    y = prof[sel]
+    i = int(np.nanargmax(y))
+    if i < 2 or i > sel.size - 3:
+        return None
+    line = y[0] + (y[-1] - y[0]) * (qg[sel[i]] - qg[sel[0]]) / (qg[sel[-1]] - qg[sel[0]])
+    if y[i] - line < 0.2 * (np.nanmax(y) - np.nanmin(y)):
+        return None
+    return float(qg[sel[i]])
+
+
 def _xcorr_shift(qg, ref, y, mask, max_shift, n=201):
     """
     Shift s (1/A) that moves profile y onto ref: y(q - s) ~ ref(q), by maximising the normalised
@@ -1493,10 +1515,9 @@ def _merged_curve(proposal, scans, cfg, qz_center=None, drift_correction=True, m
     if not np.isfinite(mref).any():
         return None
     centre = qz_center if qz_center is not None else qg[np.nanargmax(mref)]
-    win = (np.abs(qg - centre) <= 2 * hw) & np.isfinite(mref)
-    if win.sum() < 5:
-        return None
-    qw0 = qg[win][np.nanargmax(mref[win])]
+    qw0 = _find_peak(qg, mref, centre, hw, cfg.get("peak_search", 1.5))
+    if qw0 is None:
+        return None                          # no peak near the expected position in these scans
     f0 = fit_profiles(qg, mref[None, :], qw0, hw)
     q_ref = f0["center"][0] if np.isfinite(f0["center"][0]) else (f0["com"][0] if np.isfinite(f0["com"][0]) else qw0)
     xwin = (np.abs(qg - qw0) <= 2 * hw) & np.isfinite(mref)
@@ -1558,11 +1579,7 @@ def _merged_curve(proposal, scans, cfg, qz_center=None, drift_correction=True, m
             if Cb is not None:
                 Cb[j] = np.nanmean(C[fr], axis=0)
     bd = centers[keep]
-    mean = np.nanmean(Pb, axis=0)
-    search = ((np.abs(qg - qz_center) <= 2 * hw) if qz_center is not None else np.ones(qg.size, bool)) & np.isfinite(mean)
-    if not search.any():
-        return None
-    qw = qg[search][np.nanargmax(mean[search])]
+    qw = qw0                                  # fit window around the peak found before t0
     fit = fit_profiles(qg, Pb, qw, hw)
     if Cb is not None:
         w = np.clip(Cb - np.nanmin(Cb, axis=1, keepdims=True), 0, None)
@@ -1991,6 +2008,26 @@ def export_set(results, cfg, name, outdir):
     return folders
 
 
+def pack_results(cfg, out=None):
+    """
+    One zip file with everything needed for further processing (to download in one go): results/
+    (paper_export, NetCDF, figures), femtomax_config.json and the notebooks - not the converted scans
+    or the profile cache. Returns the path.
+    """
+    import zipfile
+    base = Path(cfg["_config_dir"])
+    out = Path(out) if out else base / f"femto_nx5d_results_{time.strftime('%Y%m%d_%H%M')}.zip"
+    files = [p for p in (base / cfg.get("results_dir", "results")).rglob("*") if p.is_file()]
+    files += [base / "femtomax_config.json"] + sorted(base.glob("*.ipynb"))
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in files:
+            if f.exists() and f.resolve() != out.resolve():
+                z.write(f, f.relative_to(base))
+    print(f"{out} ({out.stat().st_size / 1e6:.1f} MB, {len(files)} Dateien) -> im Dateibrowser: "
+          f"Rechtsklick auf die Datei -> Download")
+    return out
+
+
 def rsm_map(run, bins=(300, 250), smooth=1.0):
     """
     Static RSM of an angle scan directly from the scattering angles (no xraydc):
@@ -2110,6 +2147,7 @@ def main():
         return feb_setup.main(sys.argv[2:])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("catalog", help="(re)build the scan catalog")
+    sub.add_parser("pack", help="results/ + config + notebooks in one zip file (for download)")
     sub.add_parser("setup-feb", help="Config + Notebooks für Feb 2025 (siehe femto-nx5d setup-feb -h)")
     ing = sub.add_parser("ingest", help="convert scans")
     ing.add_argument("scans", nargs="*", type=int)
@@ -2123,6 +2161,8 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     cfg = load_config(a.config)
+    if a.cmd == "pack":
+        return pack_results(cfg)
     if a.cmd == "catalog":
         df = catalog(cfg, refresh=True)
         print(df.groupby(["sample", "type"], dropna=False).size())

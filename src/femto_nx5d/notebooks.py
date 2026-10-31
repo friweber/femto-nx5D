@@ -340,7 +340,10 @@ for var in ("strain_com", "strain"):
         fig = ff.fig_sets_grid(ALL, var=var, window=w)
         ff.save(fig, f"alle_{var}_{w}", FIG)
 plt.show()""")
-    md("""## 4 Paper-Skripte mit den neuen Daten
+    md("## 4 Herunterladen")
+    code("""# results/ + Config + Notebooks in eine zip-Datei (ohne umgewandelte Scans) -> Rechtsklick -> Download
+fmx.pack_results(cfg)""")
+    md("""## 5 Paper-Skripte mit den neuen Daten
 
 ```bash
 UXRD_DATA=<dieser Ordner>/results/paper_export python Analysis/strain_extraction.py
