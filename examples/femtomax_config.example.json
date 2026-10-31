@@ -1,0 +1,70 @@
+{
+  "_comment": "Beispiel-Config fuer femto_nx5d.pipeline. Als femtomax_config.json neben die Notebooks kopieren und anpassen.",
+  "raw_dirs": [
+    "/pfad/zur/beamtime/raw"
+  ],
+  "proposal_root": "/pfad/zum/arbeitsordner/Proposals/<name>",
+  "catalog_file": "catalog.csv",
+  "results_dir": "results",
+  "_roi_comment": "ROI in raw Pilatus pixels: rows (831, in the scattering plane) / cols (1475, out of plane). center = pixel of the ttheta reference, in ROI coordinates.",
+  "roi": {
+    "rows": [
+      200,
+      400
+    ],
+    "cols": [
+      650,
+      850
+    ]
+  },
+  "mask": {
+    "dilate_gaps": true,
+    "max_count": null
+  },
+  "read_mode": "roi",
+  "_read_comment": "roi: nur ROI-Pixel lesen (0.16 statt 4.9 MB/Frame); rowblock: ROI-Zeilenblock (1.2 MB); full: ganze Frames. fmx.benchmark_read zeigt, was auf dem Hub am schnellsten ist.",
+  "ping_channel": "Ping_Ch2_value",
+  "ping_t0_ps": 46199.0,
+  "scan_types": {
+    "xraydelay": "tRSS",
+    "e_gon01_pit": "sRSM",
+    "l_lwp01_energy": "fRSS"
+  },
+  "sample_tolerance_mm": 1.4,
+  "samples": {
+    "SampleA": {
+      "e_gon01_x": -5.0,
+      "beamEnergy": 8500.0,
+      "center": {
+        "row": 100,
+        "col": 100
+      },
+      "imageDistance": 320.0,
+      "theta_offset": 0.0,
+      "ttheta_offset": 0.0
+    }
+  },
+  "delay_bins_ps": [
+    [
+      -20,
+      50,
+      0.25
+    ],
+    [
+      50,
+      140,
+      0.5
+    ],
+    [
+      140,
+      4500,
+      45
+    ]
+  ],
+  "strain_ref_ps": [
+    -20,
+    -2
+  ],
+  "_qz_comment": "Fitfenster +- qz_halfwidth um den Hauptpeak.",
+  "qz_halfwidth": 0.04
+}

@@ -1,0 +1,14 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+# lokale Configs und Daten gehören nicht ins Repo
+femtomax_config.json
+feb_config.json
+*.h5
+*.nc
+*.csv
+results/
+process/
+data_export/

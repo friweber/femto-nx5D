@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "femto-nx5d"
+version = "0.1.0"
+description = "Auswertung von FemtoMAX-Daten (MAX IV): nx5d-Pipeline, ROI-Profile, Delay-Scans, Abbildungen"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "h5py",
+    "xarray",
+    "pandas",
+    "matplotlib",
+    "netCDF4",
+    "lmfit",
+    "nbformat",
+]
+
+[project.optional-dependencies]
+nx5d = ["nx5d>=3.2", "xraydc>=0.4"]
+
+[project.scripts]
+femto-nx5d = "femto_nx5d.pipeline:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

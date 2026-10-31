@@ -1,0 +1,6 @@
+{
+  "_comment": "Kopieren als feb_config.json in den Ordner der Notebooks. Relative Pfade gelten relativ zu dieser Datei.",
+  "raw_dirs": ["/pfad/zur/beamtime/raw/<collection>", "/pfad/zum/transfer/raw/<collection>"],
+  "process_dirs": ["process", "/pfad/zur/beamtime/process"],
+  "process_out": "process"
+}
