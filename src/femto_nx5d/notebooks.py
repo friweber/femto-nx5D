@@ -171,3 +171,169 @@ if __name__ == "__main__":
         sys.exit(__doc__)
     for s in sys.argv[2].split(","):
         print(make(s, sys.argv[1]))
+
+
+# ---------------------------------------------------------------------------
+# Feb 2025: sample sets with one peak per layer (femto-nx5d setup-feb)
+
+_FEB_SETUP = '''import os
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+from IPython.display import display
+from femto_nx5d import pipeline as fmx, figures as ff
+
+cfg = fmx.load_config(os.environ.get("FMX_CONFIG", "femtomax_config.json"))
+fmx.check_raw_dirs(cfg)
+RESULTS = Path(cfg["_config_dir"]) / cfg.get("results_dir", "results")
+RESULTS.mkdir(exist_ok=True)
+ff.use_style()
+
+# Auswerte-Optionen (wie bei den Seltenen Erden):
+OPTS = dict(
+    drift_correction=True,   # Profile jedes Scans um seine Peakverschiebung vor t0 korrigieren (Drift)
+    min_frames=3,            # Delay-Bins mit weniger Bildern nicht fitten (pro Scan ~10 Bilder je Delay)
+    delay_tol_ps=3.0,        # Bilder mit Ping-Ausreißern (> 3 ps vom Sollwert-Median) verwerfen
+    full_profiles=True,      # gebinnte q_z-Profile behalten (Karten, Export im alten Format)
+)'''
+
+
+def make_feb(name, outdir="."):
+    """Notebook for one sample set of the Feb 2025 beamtime."""
+    import nbformat as nbf
+    nb = nbf.v4.new_notebook(); C = []
+    md = lambda s: C.append(nbf.v4.new_markdown_cell(s))
+    code = lambda s: C.append(nbf.v4.new_code_cell(s))
+    md(f"""# {name}: Dehnung pro Schicht (FemtoMAX Feb 2025, nx5d)
+
+1. **Scans**: Gruppen (Scans je Winkel) und Peaks aus `femtomax_config.json` (`sets["{name}"]`).
+2. **Ingest**: Die Scans werden im Hintergrund ins nx5d-Format umgewandelt (läuft weiter, wenn das Notebook
+   geschlossen wird). Die Abschnitte 3–5 werten aus, was schon fertig ist – später einfach erneut ausführen.
+3. **RSM** eines Winkel-Scans der Probe: Lage der Peaks.
+4. **Auswertung**: pro Scan die Peaklage vor t0 (Drift), Profile aller Scans um die Drift verschoben,
+   zusammen gebinnt (wie bisher) und pro Delay gefittet: Gauß-Zentrum und Schwerpunkt (COM) → Dehnung.
+   Label `Ni@Au` = Ni-Peak in den Scans am Au-Winkel.
+5. **Abbildungen** und **Export im Format der bisherigen Auswertung** (`data_export`-Ordner), damit die
+   Paper-Skripte (`Analysis/strain_extraction.py` …) die neuen Daten direkt lesen.
+
+Zeitnullpunkt, Fitfenster oder Peaks ändern: in `femtomax_config.json` unter `sets["{name}"]`
+(`delay_offset`, `peaks`) und Abschnitt 4 erneut ausführen; die Bilder werden dabei nicht neu gelesen.""")
+    code(f'SET = "{name}"\n\n' + _FEB_SETUP)
+    md("## 1 Scans")
+    code("""cat = fmx.catalog(cfg)          # beim ersten Mal einige Minuten (liest alle Master-Dateien), danach catalog.csv
+display(fmx.set_overview(cfg, SET))
+print("Peaks:", {l: (p["element"], p["group"], p["qz"]) for l, p in cfg["sets"][SET]["peaks"].items()})""")
+    md("## 2 Ingest (Hintergrund)")
+    code("""JOBS = 6                 # parallele Prozesse (der Hub hat 8 Kerne)
+START_INGEST = True
+
+order = fmx.ingest_order(cat, SET, cfg=cfg)
+print(f"{len(order)} Scans, {cat['pilatus_GB'].reindex(order).sum():.0f} GB Rohdaten")
+if START_INGEST:
+    fmx.start_background_ingest(cfg, SET, series="all", jobs=JOBS)""")
+    code("""# Fortschritt (Zelle erneut ausführen); stoppen: fmx.stop_background_ingest(cfg, SET)
+done = fmx.ingest_status(cfg, cat, SET, order)""")
+    md("## 3 RSM")
+    code("""repo = fmx.repository(cfg)
+prop = fmx.open_proposal(repo, cfg["proposal"])
+rsm = [s for s in cfg["sets"][SET]["rsm_scans"] if prop is not None and str(s) in prop.all()]
+if rsm:
+    m, pk = fmx.rsm_map(prop.scan(key=str(rsm[0])))
+    fig = ff.fig_rsm_map(m, pk, title=f"{SET}: RSM Scan {rsm[0]}")
+    for l, p in cfg["sets"][SET]["peaks"].items():
+        if "@" not in l:
+            fig.axes[0].axhline(p["qz"], color=ff.ELEMENT_COLOR.get(p["element"], "k"), lw=0.6, ls=":")
+    print("Maximum:", pk)
+else:
+    print("Noch kein RSM-Scan umgewandelt:", cfg["sets"][SET]["rsm_scans"] or "keiner in which_sample.csv gefunden")""")
+    md("## 4 Auswertung")
+    code("""res = fmx.analyze_set(prop, cfg, SET, **OPTS) if prop is not None else {}
+if "_log" in res:
+    display(res["_log"])
+OUT = RESULTS / SET
+OUT.mkdir(parents=True, exist_ok=True)""")
+    md("## 5 Abbildungen und Export")
+    code("""FIG = RESULTS / "figures" / SET
+if [l for l in res if not l.startswith("_")]:
+    fig = ff.fig_set_overview(res, title=SET); ff.save(fig, f"{SET}_overview", FIG)
+    for var in ("strain_com", "strain"):
+        for w in ("lang", "kurz"):
+            fig = ff.fig_set_lines(res, w, var=var, title=SET); ff.save(fig, f"{SET}_{var}_{w}", FIG)
+    plt.show()
+else:
+    print("Noch nichts auszuwerten (Ingest abwarten).")""")
+    code("""# pro Peak: Gauß vs. Schwerpunkt, Karte, Profile
+for l in [l for l in res if not l.startswith("_")]:
+    fig, ax = plt.subplots(1, 3, figsize=(ff.COL2 * 1.3, 2.4), constrained_layout=True)
+    ff.fig_set_compare(res[l], "lang", ax=ax[0])
+    ff.fig_set_map(res[l], "lang", ax=ax[1])
+    ff.fig_set_profiles(res[l], ax=ax[2])
+    ff.save(fig, f"{SET}_{l.replace('@', '_at_')}_detail", FIG)
+    plt.show()""")
+    code("""# Export im Format von Eval_by_Project/3. NiAu/data_export (für die Paper-Skripte)
+if [l for l in res if not l.startswith("_")]:
+    for d in fmx.export_set(res, cfg, SET, RESULTS / "paper_export"):
+        print("geschrieben:", d)""")
+    nb.cells = C
+    nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3", "language": "python"}
+    path = Path(outdir) / f"{name}_analysis.ipynb"
+    nbf.write(nb, str(path))
+    return path
+
+
+def make_feb_overview(outdir="."):
+    """Notebook for all paper sample sets at once (sets with "paper": true)."""
+    import nbformat as nbf
+    nb = nbf.v4.new_notebook(); C = []
+    md = lambda s: C.append(nbf.v4.new_markdown_cell(s))
+    code = lambda s: C.append(nbf.v4.new_code_cell(s))
+    md("""# Alle Paper-Proben (FemtoMAX Feb 2025, nx5d)
+
+Ingest aller Paper-Scans im Hintergrund, dann für jede Probe die Dehnung pro Schicht, der Export im Format
+der bisherigen Auswertung (`results/paper_export/<Set>_<Gruppe>/`, Eingabe für die Paper-Skripte) und eine
+Übersicht aller Proben. Einzelheiten pro Probe: `<Set>_analysis.ipynb`.""")
+    code(_FEB_SETUP + '''
+
+SETS = [n for n, st in cfg["sets"].items() if st.get("paper")]
+print("Paper-Proben:", SETS)''')
+    md("## 1 Katalog und Ingest")
+    code("""cat = fmx.catalog(cfg)
+JOBS = 6
+START_INGEST = True
+order = fmx.ingest_order(cat, "paper", cfg=cfg)
+print(f"{len(order)} Scans, {cat['pilatus_GB'].reindex(order).sum():.0f} GB Rohdaten")
+if START_INGEST:
+    fmx.start_background_ingest(cfg, "paper", series="all", jobs=JOBS)""")
+    code("""done = fmx.ingest_status(cfg, cat, "paper", order)""")
+    md("## 2 Auswertung aller Proben")
+    code("""repo = fmx.repository(cfg)
+prop = fmx.open_proposal(repo, cfg["proposal"])
+ALL, LOGS = {}, []
+for name in SETS:
+    r = fmx.analyze_set(prop, cfg, name, **OPTS) if prop is not None else {}
+    ALL[name] = r
+    if "_log" in r:
+        LOGS.append(r["_log"].assign(Set=name))
+    if [l for l in r if not l.startswith("_")]:
+        fmx.export_set(r, cfg, name, RESULTS / "paper_export")
+if LOGS:
+    import pandas as pd
+    display(pd.concat(LOGS).reset_index().set_index(["Set", "Peak"]))""")
+    md("## 3 Übersicht")
+    code("""FIG = RESULTS / "figures" / "Alle_Proben"
+for var in ("strain_com", "strain"):
+    for w in ("lang", "kurz"):
+        fig = ff.fig_sets_grid(ALL, var=var, window=w)
+        ff.save(fig, f"alle_{var}_{w}", FIG)
+plt.show()""")
+    md("""## 4 Paper-Skripte mit den neuen Daten
+
+```bash
+UXRD_DATA=<dieser Ordner>/results/paper_export python Analysis/strain_extraction.py
+```
+Die Ordnernamen (`NiAu100_400_Au`, …) und Peak-Namen entsprechen denen der bisherigen `data_export`-Ordner.""")
+    nb.cells = C
+    nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3", "language": "python"}
+    path = Path(outdir) / "Alle_Proben.ipynb"
+    nbf.write(nb, str(path))
+    return path

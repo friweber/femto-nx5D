@@ -370,3 +370,159 @@ def fig_loops(ds, series, value, window="kurz", ax=None, title=None):
     ax.legend(loc="best")
     ax.set_title(title if title is not None else f"{series}, {value:g}", loc="left")
     return fig
+
+
+# ---------------------------------------------------------------------------
+# sample sets (Feb 2025): one curve per layer/peak, input = pipeline.analyze_set
+
+ELEMENT_COLOR = {"Cu": "#b5452a", "Au": "#c28e00", "Ni": "#3c6ea3"}   # as in the NiAu/CuAu paper
+SET_WINDOWS = {
+    "lang": {"range": (-5, 200), "xscale": "linear"},
+    "kurz": {"range": (-5, 30), "xscale": "linear"},
+}
+SET_LABEL = {"strain": "Dehnung, Gauß-Zentrum (‰)", "strain_com": "Dehnung, Schwerpunkt (‰)",
+             "sigma": "Peakbreite σ (Å$^{-1}$)", "intensity": "Intensität (w. E.)"}
+
+
+def _labels(results):
+    return [l for l in results if not l.startswith("_")]
+
+
+def _style_of(ds):
+    """colour by element; dashed if the peak is fitted in the scans of another layer's angle"""
+    el = ds.attrs.get("peak", "")
+    return ELEMENT_COLOR.get(el, INK2), ("-" if ds.attrs.get("group") == el else "--")
+
+
+def fig_set_lines(results, window="lang", var="strain_com", ax=None, title=None, labels=None, band=True):
+    """Strain (or another variable) vs. delay, one line per peak of the set."""
+    fig, ax = _ax(ax, (COL1, 2.3))
+    w = SET_WINDOWS[window]
+    shown = 0
+    for l in labels or _labels(results):
+        ds = results[l]
+        d = ds[var].sel(delay=slice(*w["range"])).dropna("delay")
+        if d.size == 0:
+            continue
+        c, ls = _style_of(ds)
+        ax.plot(d.delay, d, ls, color=c, lw=1.1, label=l)
+        if band and var == "strain" and "center_err" in ds:
+            e = (ds["center_err"] / ds.attrs.get("q_ref", np.nan) * 1e3).sel(delay=d.delay)
+            ax.fill_between(d.delay, d - e, d + e, color=c, alpha=0.18, lw=0)
+        shown += 1
+    if not shown:
+        return _empty(ax) or fig
+    ax.axhline(0, color=INK2, lw=0.5)
+    ax.set_xlim(*w["range"])
+    ax.set_xlabel("Delay (ps)")
+    ax.set_ylabel(SET_LABEL.get(var, var))
+    ax.legend(loc="best")
+    if title:
+        ax.set_title(title)
+    return fig
+
+
+def fig_set_compare(ds, window="lang", ax=None, title=None):
+    """Gauss centre vs. centre of mass for one peak (the paper compares the COM with the model)."""
+    fig, ax = _ax(ax, (COL1, 2.3))
+    w = SET_WINDOWS[window]
+    c, _ = _style_of(ds)
+    for var, ls, lab in (("strain", "-", "Gauß-Zentrum"), ("strain_com", ":", "Schwerpunkt")):
+        d = ds[var].sel(delay=slice(*w["range"])).dropna("delay")
+        ax.plot(d.delay, d, ls, color=c, lw=1.1, label=lab)
+    ax.axhline(0, color=INK2, lw=0.5)
+    ax.set(xlim=w["range"], xlabel="Delay (ps)", ylabel="Dehnung (‰)")
+    ax.legend(loc="best")
+    ax.set_title(title or ds.attrs.get("label", ""))
+    return fig
+
+
+def fig_set_map(ds, window="lang", ax=None, title=None, span=3.0, log=False):
+    """Binned q_z profiles over delay (needs full_profiles=True) with the fitted peak position."""
+    from matplotlib.colors import LogNorm
+    fig, ax = _ax(ax, (COL1, 2.4))
+    if "intensity_full" not in ds:
+        return _empty(ax, "analyze_set(..., full_profiles=True) nötig") or fig
+    w = SET_WINDOWS[window]
+    hw = float(np.nanmax(np.abs(ds.q_rel))) / 2 if "q_rel" in ds else 0.05
+    q0 = ds.attrs.get("q_ref", float(ds["center"].mean()))
+    I = ds["intensity_full"].sel(delay=slice(*w["range"]), qz=slice(q0 - span * hw, q0 + span * hw))
+    if I.size == 0:
+        return _empty(ax) or fig
+    norm = LogNorm(vmin=max(float(I.quantile(0.05)), 1e-6), vmax=float(I.max())) if log else None
+    m = ax.pcolormesh(I.delay, I.qz, I.T, cmap=SEQUENTIAL, shading="nearest", norm=norm, rasterized=True)
+    fig.colorbar(m, ax=ax, label="Intensität (w. E.)", pad=0.02)
+    c = ds["center"].sel(delay=slice(*w["range"]))
+    ax.plot(c.delay, c, color=ACCENT, lw=0.9, label="Gauß-Zentrum")
+    ax.set(xlim=w["range"], xlabel="Delay (ps)", ylabel="q$_z$ (Å$^{-1}$)")
+    ax.legend(loc="upper right")
+    ax.set_title(title or ds.attrs.get("label", ""))
+    return fig
+
+
+def fig_set_profiles(ds, delays=(-3, 5, 20, 100), ax=None, title=None, span=3.0):
+    """q_z profiles at a few delays (light -> dark = early -> late)."""
+    fig, ax = _ax(ax, (COL1, 2.3))
+    if "intensity_full" not in ds:
+        return _empty(ax, "analyze_set(..., full_profiles=True) nötig") or fig
+    hw = float(np.nanmax(np.abs(ds.q_rel))) / 2 if "q_rel" in ds else 0.05
+    q0 = ds.attrs.get("q_ref", float(ds["center"].mean()))
+    cols = ramp(BLUE_RAMP, len(delays))
+    for c, t in zip(cols, delays):
+        p = ds["intensity_full"].sel(delay=t, method="nearest").sel(qz=slice(q0 - span * hw, q0 + span * hw))
+        ax.plot(p.qz, p, color=c, lw=1.0, label=f"{float(p.delay):.1f} ps")
+    ax.set(xlabel="q$_z$ (Å$^{-1}$)", ylabel="Intensität (w. E.)")
+    ax.legend(loc="best")
+    ax.set_title(title or ds.attrs.get("label", ""))
+    return fig
+
+
+def fig_set_overview(results, title=None):
+    """2 x 2: strain (COM) long and short window, maps of the two main peaks."""
+    labels = _labels(results)
+    main = [l for l in labels if results[l].attrs.get("group") == results[l].attrs.get("peak")][:2] or labels[:2]
+    fig, axs = plt.subplots(2, 2, figsize=(COL2, 4.6))
+    fig_set_lines(results, "lang", ax=axs[0, 0], title="Schwerpunkt, −5 … 200 ps")
+    fig_set_lines(results, "kurz", ax=axs[0, 1], title="Schwerpunkt, −5 … 30 ps")
+    for a, l in zip(axs[1], main):
+        fig_set_map(results[l], "lang", ax=a)
+    for a in axs[1][len(main):]:
+        a.axis("off")
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    return fig
+
+
+def fig_rsm_map(m, peak=None, ax=None, title=None):
+    """RSM from pipeline.rsm_map (log intensity)."""
+    from matplotlib.colors import LogNorm
+    fig, ax = _ax(ax, (COL1, 2.6))
+    v = m.where(m > 0)
+    mm = ax.pcolormesh(m.qx, m.qz, v, cmap=SEQUENTIAL, shading="nearest", rasterized=True,
+                       norm=LogNorm(vmin=max(float(v.quantile(0.02)), 1e-6), vmax=float(v.max())))
+    fig.colorbar(mm, ax=ax, label="Intensität (w. E.)", pad=0.02)
+    if peak:
+        ax.plot(peak["qx"], peak["qz"], "+", color=ACCENT, ms=9)
+    ax.set(xlabel="q$_x$ (Å$^{-1}$)", ylabel="q$_z$ (Å$^{-1}$)")
+    ax.set_title(title or f"RSM Scan {m.attrs.get('scan', '')}")
+    return fig
+
+
+def fig_sets_grid(all_results, var="strain_com", window="lang", ncols=4):
+    """One panel per sample set (e.g. the 8 paper samples), same y range."""
+    names = [n for n, r in all_results.items() if r and _labels(r)]
+    if not names:
+        fig, ax = plt.subplots(figsize=(COL1, 2))
+        return _empty(ax, "keine Ergebnisse") or fig
+    nrows = int(np.ceil(len(names) / ncols))
+    fig, axs = plt.subplots(nrows, ncols, figsize=(COL2, 1.9 * nrows), sharex=True, sharey=True, squeeze=False)
+    for a, n in zip(axs.flat, names):
+        fig_set_lines(all_results[n], window, var=var, ax=a, title=n, band=False)
+        a.set_xlabel(""); a.set_ylabel("")
+    for a in list(axs.flat)[len(names):]:
+        a.axis("off")
+    fig.supxlabel("Delay (ps)")
+    fig.supylabel(SET_LABEL.get(var, var))
+    fig.tight_layout()
+    return fig

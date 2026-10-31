@@ -38,6 +38,34 @@ from femto_nx5d import pipeline as fmx, figures as ff
 cfg = fmx.load_config("femtomax_config.json")
 ```
 
+### Strahlzeit Feb 2025 (Schichtproben, ein Peak pro Schicht)
+Auf dem Hub, im Arbeitsordner:
+
+```bash
+femto-nx5d setup-feb --raw <rohdaten-ordner> --out .
+```
+
+legt `femtomax_config.json`, ein `<Set>_analysis.ipynb` pro Proben-Set und `Alle_Proben.ipynb` an.
+- Die Proben-Sets kommen aus den Scanlisten `measurement_file_<Set>.txt` (gesucht unter `Eval*/…/scan_files`
+  oder `--scan-files`).
+- Die RSM-Scans kommen aus `which_sample.csv`.
+- Die Geometrie je Scan (Mittelpixel, Austrittswinkel) wird aus den vorhandenen `process/scan-N_roi_profile.nc`
+  gelesen, damit die q-Skala der bisherigen Auswertung erhalten bleibt.
+
+Unterschiede zur Okt-Geometrie (alles in der Config):
+- `scatter_axis: cols`: Der Detektor ist um 90° gedreht.
+- `theta_motor: e_gon01_keta`.
+- `geometry: fixed_exit` mit q_z = k (sin a_in + sin a_out).
+- `ping_t0_ps` gilt abschnittsweise je Scanbereich.
+
+Ausgewertet wird mit `loop_mode: merge`:
+1. Die Drift jedes Scans wird aus seinem Profil vor t0 bestimmt.
+2. Die Profile werden verschoben.
+3. Danach werden alle Scans zusammen gebinnt und gefittet.
+
+`pipeline.export_set` schreibt die Ergebnisse im Format der bisherigen `data_export`-Ordner
+(`binned_intensity_numpy_style.dat`, `results_export_*.dat`).
+
 ### Profil-Auswertung (`feb`)
 `examples/feb_config.example.json` als `feb_config.json` in den Ordner der Notebooks kopieren:
 

@@ -137,6 +137,19 @@ def check_raw_dirs(cfg):
     return found
 
 
+def ping_t0(cfg, scan):
+    """Ping time zero (ps): a number, or [[first_scan, t0], ...] (piecewise by scan number)."""
+    t0 = cfg["ping_t0_ps"]
+    if np.isscalar(t0):
+        return float(t0)
+    t0 = sorted((int(a), float(b)) for a, b in t0)
+    val = t0[0][1]
+    for first, v in t0:
+        if int(scan) >= first:
+            val = v
+    return val
+
+
 def find_master(scan, cfg):
     for d in cfg["raw_dirs"]:
         p = Path(d) / f"scan-{int(scan)}.h5"
@@ -150,6 +163,8 @@ def detect_sample(e_gon01_x, cfg, scan=None):
     Sample of a scan: by the scan ranges in the config ("scan_ranges": [[first, last], ...])
     if a sample has them, otherwise the nearest sample position `e_gon01_x`.
     """
+    if cfg.get("proposal"):          # one proposal for all scans (same geometry)
+        return cfg["proposal"]
     if scan is not None:
         for name, s in cfg["samples"].items():
             if any(a <= int(scan) <= b for a, b in s.get("scan_ranges", [])):
@@ -259,6 +274,7 @@ def catalog(cfg, refresh=False):
                 "temperature_a": snap.get("temperature_a"),
                 "e_gon01_x": snap.get("e_gon01_x"),
                 "e_gon01_pit": snap.get("e_gon01_pit"),
+                "angle": snap.get(cfg.get("theta_motor", "e_gon01_pit")),
                 "pump": snap.get("l_lwp01_energy"),
                 "xraydelay_ps": snap.get("xraydelay", np.nan) * 1e12,
                 "pilatus_GB": pil.stat().st_size / 1e9 if pil.exists() else 0.0,
@@ -352,23 +368,28 @@ def ingest_scan(scan, cfg, sample=None, overwrite=False, block=32):
             return np.repeat(info["points"][name] * scale, ntrig)[:n]
         return np.full(n, snap.get(name, np.nan) * scale)
 
-    pit = per_frame("e_gon01_pit")
+    theta_motor = cfg.get("theta_motor", "e_gon01_pit")
+    pit = per_frame(theta_motor) * cfg.get("theta_sign", 1.0)
     delay_set = per_frame("xraydelay", 1e12)
     pch = cfg.get("ping_channel", "Ping_Ch2_value")
+    t0 = ping_t0(cfg, scan)
     if pch in ping:
-        delay = ping[pch][:n] - cfg["ping_t0_ps"]
+        delay = ping[pch][:n] - t0
     else:
         logger.warning(f"{scan}: no {pch}, using setpoint as delay")
         delay = delay_set.copy()
 
     # --- write --------------------------------------------------------------
-    # Pilatus rows lie in the scattering plane. Images are stored transposed,
-    # (index, out-of-plane, in-plane), as in the PXS files, so that with
-    # imageAxes ("y-", "z-") xraydc labels the specular direction "qz".
+    # Images are stored as (index, out-of-plane, in-plane), as in the PXS files,
+    # so that with imageAxes ("y-", "z-") xraydc labels the specular direction "qz".
+    # scatter_axis "rows" (Okt 2025): Pilatus rows lie in the scattering plane ->
+    # stored transposed; "cols" (Feb 2025, detector turned by 90 deg): stored as is.
     (r0, r1), (c0, c1) = cfg["roi"]["rows"], cfg["roi"]["cols"]
     nr, nc = r1 - r0, c1 - c0
+    by_cols = cfg.get("scatter_axis", "rows") == "cols"
+    shape = (n, nr, nc) if by_cols else (n, nc, nr)
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_suffix(".h5.part")
+    tmp = out.with_suffix(f".h5.part{os.getpid()}")
 
     header = {
         "sample": sample,
@@ -395,19 +416,21 @@ def ingest_scan(scan, cfg, sample=None, overwrite=False, block=32):
         fo.attrs["fmx-ingest-version"] = INGEST_VERSION
         fo.attrs["source"] = str(master)
         fo.attrs["roi"] = json.dumps(cfg["roi"])
-        fo.attrs["ping_t0_ps"] = cfg["ping_t0_ps"]
+        fo.attrs["ping_t0_ps"] = t0
         fo.attrs["ping_channel"] = pch
 
         img = fo.create_dataset(
-            "instrument/pilatus/images", shape=(n, nc, nr), dtype="float32",
-            chunks=(min(16, n), nc, nr), compression="gzip",
+            "instrument/pilatus/images", shape=shape, dtype="float32",
+            chunks=(min(16, n),) + shape[1:], compression="gzip",
             compression_opts=4, shuffle=True)
 
         gap_mask = None
         max_count = cfg.get("mask", {}).get("max_count")
         for i in range(0, n, block):
             j = min(i + block, n)
-            a = read_roi(i, j).astype("float32").transpose(0, 2, 1)
+            a = read_roi(i, j).astype("float32")
+            if not by_cols:
+                a = a.transpose(0, 2, 1)
             if gap_mask is None:
                 gap_mask = a[0] == -1
                 if cfg.get("mask", {}).get("dilate_gaps", True):
@@ -422,11 +445,16 @@ def ingest_scan(scan, cfg, sample=None, overwrite=False, block=32):
 
         fo["instrument/motors/theta"] = pit
         # detector angle: follows pit (convention of the earlier FemtoMAX
-        # notebooks) or stays at the pre-scan pit (detector fixed)
-        if cfg.get("ttheta_follows_pit", True):
+        # notebooks), stays at the pre-scan pit (detector fixed), or - geometry
+        # "fixed_exit" (Feb 2025) - 0 here and the exit angle of the centre pixel
+        # comes from the spice offset "ttheta"
+        if cfg.get("geometry", "symmetric") == "fixed_exit":
+            fo["instrument/motors/ttheta"] = np.zeros(n)
+        elif cfg.get("ttheta_follows_pit", True):
             fo["instrument/motors/ttheta"] = pit
         else:
-            fo["instrument/motors/ttheta"] = np.full(n, snap["e_gon01_pit"])
+            fo["instrument/motors/ttheta"] = np.full(
+                n, snap[theta_motor] * cfg.get("theta_sign", 1.0))
         fo["measurement/delay"] = delay
         fo["measurement/delay"].attrs["units"] = "ps"
         fo["measurement/delay_set"] = delay_set
@@ -617,16 +645,21 @@ def ingest_many(scans, cfg, overwrite=False, jobs=1):
 # nx5d repository + spice
 
 def exp_info(sample_cfg, cfg):
-    # stored images are (out-of-plane = ROI cols, in-plane = ROI rows)
+    # stored images are (out-of-plane, in-plane): ROI (cols, rows) for scatter_axis
+    # "rows", ROI (rows, cols) for "cols"; center = {"row", "col"} in ROI pixels
     (r0, r1), (c0, c1) = cfg["roi"]["rows"], cfg["roi"]["cols"]
     ctr = sample_cfg["center"]
+    if cfg.get("scatter_axis", "rows") == "cols":
+        size, center = [r1 - r0, c1 - c0], [ctr["row"], ctr["col"]]
+    else:
+        size, center = [c1 - c0, r1 - r0], [ctr["col"], ctr["row"]]
     return {
         "goniometerAxes": {"theta": "y-"},
         "detectorAxes": {"ttheta": "y-"},
         "detectorTARAlign": [0.0, 0.0, 0.0],
         "imageAxes": ["y-", "z-"],
-        "imageSize": [c1 - c0, r1 - r0],
-        "imageCenter": [ctr["col"], ctr["row"]],
+        "imageSize": size,
+        "imageCenter": center,
         "imageDistance": sample_cfg["imageDistance"],
         "imageChannelSize": [0.172, 0.172],
         "sampleFaceUp": "z+",
@@ -652,12 +685,18 @@ def seed_spice(proposal, cfg):
     sp = proposal.spice
     seeds = {
         "exp_info": exp_info(s, cfg),
-        "offsets": {"theta": s["theta_offset"], "ttheta": s["ttheta_offset"], "delay": 0.0},
-        "recipes": {"tRSS": "pymod:///femtomax_nx5d#tRSS",
-                    "fRSS": "pymod:///femtomax_nx5d#fRSS",
-                    "sRSM": "pymod:///femtomax_nx5d#sRSM"},
+        "offsets": {"theta": s["theta_offset"], "ttheta": s["ttheta_offset"],
+                    "delay": s.get("delay_offset", 0.0)},
+        "recipes": {"tRSS": "pymod:///femto_nx5d.pipeline#tRSS",
+                    "fRSS": "pymod:///femto_nx5d.pipeline#fRSS",
+                    "sRSM": "pymod:///femto_nx5d.pipeline#sRSM"},
         "qargs": {"groupby": None, "dims": None, "qsize": None, "gridargs": None},
         "binning": {"delay": cfg.get("delay_bins_ps"), "pump_round": 1},
+        # "symmetric": q_z = 4 pi/lambda sin(2theta/2) of every detector row (Okt 2025);
+        # "fixed_exit": q_z = k (sin a_in + sin a_out), a_in = theta, a_out = ttheta - pixel
+        # angle (Feb 2025, as in the earlier profile evaluation)
+        "geometry": {"mode": cfg.get("geometry", "symmetric"),
+                     **({"two_theta_lab": cfg["two_theta_lab"]} if "two_theta_lab" in cfg else {})},
     }
     written = False
     for handle, payload in seeds.items():
@@ -917,12 +956,22 @@ def rsm_scans(cat, sample):
     return [int(s) for s in r.assign(_k=(key > 0)).sort_values(["_k"]).index]
 
 
-def ingest_order(cat, sample, series="fluence"):
+def ingest_order(cat, sample, series="fluence", cfg=None):
     '''
     Scans to ingest for one sample: RSM first, then the series from the
     smallest to the largest (by Pilatus GB), so that first complete series
-    are available early.
+    are available early. With sample sets (cfg["sets"], Feb 2025): `sample` is a set
+    name or "paper" (all sets marked "paper"); scans not in the catalog are left out.
     '''
+    if cfg is not None and cfg.get("sets") and (sample in cfg["sets"] or sample == "paper"):
+        names = [n for n, st in cfg["sets"].items() if st.get("paper")] if sample == "paper" else [sample]
+        first, rest = [], []
+        for n in names:
+            scans, rsm = set_scans(cfg, n)
+            first += rsm[:1]
+            rest += scans
+        have = set(cat.index)
+        return [s for s in dict.fromkeys(first + rest) if s in have]
     groups = []
     if series in ("fluence", "all"):
         groups += list(fluence_series(cat, sample).values())
@@ -954,7 +1003,7 @@ def _running_pid(cfg, sample):
                  if l.startswith("State:")][0]
     except (OSError, IndexError):
         return None
-    if b"femtomax_nx5d" not in cmd or "zombie" in state:
+    if not (b"femtomax_nx5d" in cmd or b"femto_nx5d" in cmd) or "zombie" in state:
         return None
     return pid
 
@@ -996,7 +1045,7 @@ def stop_background_ingest(cfg, sample):
 
 def ingest_status(cfg, cat, sample, scans):
     '''Prints how many of `scans` are converted, and the last log line.'''
-    done = [s for s in scans if scan_file(cfg, sample, s).exists()]
+    done = [s for s in scans if scan_file(cfg, cfg.get("proposal") or sample, s).exists()]
     gb = cat["pilatus_GB"]
     pid = _running_pid(cfg, sample)
     print(f"{sample}: {len(done)}/{len(scans)} Scans umgewandelt "
@@ -1118,36 +1167,94 @@ def _mask_hot_pixels(d, factor=8.0):
     return d
 
 
-def load_profiles(proposal, scans, delay_tol_ps=3.0):
+def _profile_cache_key(spice, delay_tol_ps):
+    import hashlib
+    keep = {"exp_info": spice.get("exp_info"), "geometry": spice.get("geometry"),
+            "offsets": {k: v for k, v in (spice.get("offsets") or {}).items() if k != "delay"},
+            "delay_tol_ps": delay_tol_ps, "version": 1}
+    return hashlib.sha1(json.dumps(keep, sort_keys=True, default=str).encode()).hexdigest()[:10]
+
+
+def _with_override(spice, ov):
+    """Spice copy with a per-scan geometry: ov = {"center_inplane": ROI pixel, "ttheta": angle offset}."""
+    import copy
+    if not ov:
+        return spice
+    sp = copy.deepcopy(spice)
+    if ov.get("center_inplane") is not None:
+        sp["exp_info"]["imageCenter"] = [sp["exp_info"]["imageCenter"][0], float(ov["center_inplane"])]
+    if ov.get("ttheta") is not None:
+        sp.setdefault("offsets", {})["ttheta"] = float(ov["ttheta"])
+    return sp
+
+
+def scan_geometry(cfg, scan, set_name=None, group=None):
+    """
+    Per-scan geometry override (Feb 2025): centre pixel and exit angle of the centre pixel as
+    in the earlier evaluation (cfg["scan_geometry"][scan] = [center_pixel, exit_angle], pixel of
+    the rotated image), else the group default cfg["sets"][set]["geometry"][group]; converted
+    to the stored ROI (in-plane pixel = cfg["old_pixel_to_roi"] - center_pixel). None if not used.
+    """
+    if not cfg.get("use_scan_geometry", True):
+        return None
+    g = (cfg.get("scan_geometry") or {}).get(str(int(scan)))
+    if g is None and set_name is not None and group is not None:
+        g = ((cfg.get("sets") or {}).get(set_name, {}).get("geometry") or {}).get(group)
+    if g is None:
+        return None
+    return {"center_inplane": cfg.get("old_pixel_to_roi", 1000) - g[0], "ttheta": g[1]}
+
+
+def load_profiles(proposal, scans, delay_tol_ps=3.0, cache_dir=None, overrides=None):
     """
     Memory-friendly variant of load_frames for the 'q_x = q_y = 0' analysis:
     every scan is loaded, reduced to row/column profiles (frame x ~200 values)
     and released. Returns dict(delay, prof, colp, qz, qy, dropped, spice) or None.
+    With `cache_dir` the profiles of every scan are kept on disk (key: geometry and
+    angle offsets of the spice), so re-analysing with other peaks, windows, bins or
+    time zero does not read the images again.
     """
     runs = [proposal.scan(key=str(s)) for s in scans if str(int(s)) in proposal.all()]
     if not runs:
         return None
-    spice = {k: v.data() for k, v in runs[0].spice.data.items()}
+    spice0 = {k: v.data() for k, v in runs[0].spice.data.items()}
+    spice = spice0
     delays, profs, cols, dropped, qz_ref, qy = [], [], [], 0, None, None
     for r in runs:
-        d = r.raw.compute()
-        dl, ds_ = d["delay"].values, d["delay_set"].values
-        ok = np.ones(dl.size, bool)
-        for v in np.unique(ds_):
-            sel = ds_ == v
-            ok[sel] = np.abs(dl[sel] - np.nanmedian(dl[sel])) < delay_tol_ps
-        dropped += int((~ok).sum())
-        d = d.isel(index=np.where(ok)[0])
-        d = _mask_hot_pixels(d)
-        prof, qz, colp, qy = frame_profiles(d, spice)
+        sp = _with_override(spice0, (overrides or {}).get(int(r.key)))
+        key = _profile_cache_key(sp, delay_tol_ps)
+        cache = Path(cache_dir) / f"{r.key}_{key}.npz" if cache_dir else None
+        if cache is not None and cache.exists():
+            c = np.load(cache)
+            prof, qz, colp, qy, dl = c["prof"], c["qz"], c["colp"], c["qy"], c["delay"]
+            dropped += int(c["dropped"])
+        else:
+            d = r.raw.compute()
+            dl, ds_ = d["delay"].values, d["delay_set"].values
+            ok = np.ones(dl.size, bool)
+            for v in np.unique(ds_):
+                sel = ds_ == v
+                ok[sel] = np.abs(dl[sel] - np.nanmedian(dl[sel])) < delay_tol_ps
+            n_drop = int((~ok).sum())
+            dropped += n_drop
+            d = d.isel(index=np.where(ok)[0])
+            d = _mask_hot_pixels(d)
+            prof, qz, colp, qy = frame_profiles(d, sp)
+            dl = d["delay"].values
+            del d
+            if cache is not None:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                tmp = cache.with_suffix(f".tmp{os.getpid()}.npz")
+                np.savez(tmp, prof=prof.astype(np.float32), qz=qz, colp=colp.astype(np.float32), qy=qy,
+                         delay=dl, dropped=n_drop)
+                os.replace(tmp, cache)
         if qz_ref is None:
             qz_ref = qz
         elif not np.allclose(qz, qz_ref):
             prof = np.array([np.interp(qz_ref, qz, p, left=np.nan, right=np.nan) for p in prof])
-        delays.append(d["delay"].values)
+        delays.append(dl)
         profs.append(prof.astype(np.float32))
         cols.append(colp.astype(np.float32))
-        del d
         _release(r)
     return {"delay": np.concatenate(delays), "prof": np.concatenate(profs), "colp": np.concatenate(cols),
             "qz": qz_ref, "qy": qy, "dropped": dropped, "spice": spice}
@@ -1164,6 +1271,7 @@ def frame_profiles(data, spice):
     ei, off = spice["exp_info"], spice.get("offsets") or {}
     img = data["images"].values                             # (frames, out-of-plane, in-plane), float32
     lam = 12398.42 / ei["beamEnergy"]                        # Angstrom
+    k = 2 * np.pi / lam
     col_c, row_c = ei["imageCenter"]
     dist = ei["imageDistance"]
     px_col, px_row = ei["imageChannelSize"]
@@ -1173,11 +1281,22 @@ def frame_profiles(data, spice):
     with np.errstate(all="ignore"):
         prof = np.nanmean(img, axis=1)                      # (frames, rows)
         colp = np.nanmean(img, axis=2)                      # (frames, cols)
-    qz = 4 * np.pi / lam * np.sin(np.radians(tth[0] - d2) / 2)
-    if np.ptp(tth) > 1e-4:                                   # different detector angles -> common grid
+    if (spice.get("geometry") or {}).get("mode", "symmetric") == "fixed_exit":
+        th = data["theta"].values + off.get("theta", 0.0)   # incidence angle
+
+        def q_of(i):
+            return k * (np.sin(np.radians(th[i])) + np.sin(np.radians(tth[i] - d2)))
+        varies = np.ptp(tth) > 1e-4 or np.ptp(th) > 1e-4
+    else:
+        def q_of(i):
+            return 2 * k * np.sin(np.radians(tth[i] - d2) / 2)
+        varies = np.ptp(tth) > 1e-4
+    qz = q_of(0)
+    if varies:                                               # different angles -> common grid
         for i in range(prof.shape[0]):
-            q_i = 4 * np.pi / lam * np.sin(np.radians(tth[i] - d2) / 2)
-            prof[i] = np.interp(qz, q_i[::-1], prof[i][::-1], left=np.nan, right=np.nan)
+            q_i = q_of(i)
+            o = np.argsort(q_i)
+            prof[i] = np.interp(qz, q_i[o], prof[i][o], left=np.nan, right=np.nan)
     qy = 2 * np.pi / lam * np.sin(np.arctan((np.arange(img.shape[1]) - col_c) * px_col / dist))
     order = np.argsort(qz)
     return prof[:, order], qz[order], colp, qy
@@ -1198,16 +1317,19 @@ def fit_profiles(qz, P, center, halfwidth):
     from scipy.optimize import curve_fit
     sel = np.abs(qz - center) <= halfwidth
     x = qz[sel]
-    out = {k: np.full(P.shape[0], np.nan) for k in ("center", "center_err", "sigma", "amplitude", "com")}
+    out = {k: np.full(P.shape[0], np.nan)
+           for k in ("center", "center_err", "sigma", "amplitude", "com", "intensity", "stdev")}
     for i, y in enumerate(P[:, sel]):
         m = np.isfinite(y)
         if m.sum() < 6:
             continue
         xx, yy = x[m], y[m]
+        out["intensity"][i] = yy.mean()
         base = np.nanmin(yy)
         w = np.clip(yy - base, 0, None)
         if w.sum() > 0:
             out["com"][i] = (xx * w).sum() / w.sum()
+            out["stdev"][i] = np.sqrt((w * (xx - out["com"][i]) ** 2).sum() / w.sum())
         p0 = (yy.max() - base, xx[np.argmax(yy)], halfwidth / 4, base)
         lo = (0, center - halfwidth, halfwidth / 40, -np.inf)
         hi = (np.inf, center + halfwidth, halfwidth, np.inf)
@@ -1225,10 +1347,12 @@ def fit_profiles(qz, P, center, halfwidth):
     return out
 
 
-def _loop_curve(proposal, scans, cfg, qz_center, qx_qy_zero=True, min_frames=5, delay_tol_ps=3.0):
+def _loop_curve(proposal, scans, cfg, qz_center, qx_qy_zero=True, min_frames=5, delay_tol_ps=3.0,
+                halfwidth=None, delay_offset=0.0, delay_bins=None, overrides=None):
     """Binned profiles + fits of one loop. Returns dict or None."""
     if qx_qy_zero:
-        L = load_profiles(proposal, scans, delay_tol_ps)
+        cache = Path(cfg["proposal_root"]) / proposal.key / "profiles" if cfg.get("profile_cache", True) else None
+        L = load_profiles(proposal, scans, delay_tol_ps, cache_dir=cache, overrides=overrides)
         if L is None:
             return None
         spice, dropped = L["spice"], L["dropped"]
@@ -1238,10 +1362,10 @@ def _loop_curve(proposal, scans, cfg, qz_center, qx_qy_zero=True, min_frames=5, 
         if data is None:
             return None
         raw_delay = data["delay"].values
-    hw = cfg.get("qz_halfwidth", 0.04)
+    hw = halfwidth or cfg.get("qz_halfwidth", 0.04)
     ref = tuple(cfg.get("strain_ref_ps", (-20, -2)))
-    edges = _bin_edges((spice.get("binning") or {}).get("delay") or cfg.get("delay_bins_ps"))
-    delays = raw_delay + ((spice.get("offsets") or {}).get("delay") or 0.0)
+    edges = _bin_edges(delay_bins or (spice.get("binning") or {}).get("delay") or cfg.get("delay_bins_ps"))
+    delays = raw_delay + ((spice.get("offsets") or {}).get("delay") or 0.0) + (delay_offset or 0.0)
     idx, ok = _bin(delays, edges)
     centers = 0.5 * (edges[:-1] + edges[1:])
     if qx_qy_zero:
@@ -1269,7 +1393,14 @@ def _loop_curve(proposal, scans, cfg, qz_center, qx_qy_zero=True, min_frames=5, 
         return None
     # peak window from the mean profile (near qz_center if given)
     mean = np.nanmean(P, axis=0)
-    search = np.abs(qz - qz_center) <= 5 * hw if qz_center is not None else np.isfinite(mean)
+    if qz_center is not None:
+        if not (np.nanmin(qz) <= qz_center <= np.nanmax(qz)):
+            return None                      # peak not on the detector in these scans
+        search = (np.abs(qz - qz_center) <= 2 * hw) & np.isfinite(mean)
+    else:
+        search = np.isfinite(mean)
+    if not search.any():
+        return None
     q0 = qz[search][np.nanargmax(mean[search])]
     fit = fit_profiles(qz, P, q0, hw)
     # peak position perpendicular (snail trace): column COM around the peak
@@ -1282,27 +1413,166 @@ def _loop_curve(proposal, scans, cfg, qz_center, qx_qy_zero=True, min_frames=5, 
     Pw = np.array([np.interp(q0 + rel, qz, p, left=np.nan, right=np.nan) for p in P])
     refsel = (bd >= ref[0]) & (bd <= ref[1]) & np.isfinite(fit["center"])
     return {"delay": bd, "frames": counts, "qy_com": qy_com, "profile": Pw, "q_rel": rel, "q_window": q0,
+            "P_full": P, "qz": qz,
             "q0": float(np.nanmean(fit["center"][refsel])) if refsel.any() else np.nan,
             "dropped": dropped, "scans": list(scans), **fit}
 
 
+def _merged_curve(proposal, scans, cfg, qz_center=None, drift_correction=True, min_frames=5,
+                  delay_tol_ps=3.0, halfwidth=None, delay_offset=0.0, delay_bins=None, full_profiles=False,
+                  overrides=None):
+    """
+    loop_mode "merge" (Feb 2025: every scan is one full delay sweep with ~10 frames per delay):
+    the peak position before t0 is determined per scan from its averaged pre-t0 profile, every
+    scan's profiles are shifted by its drift onto a common q grid, then the frames of all scans
+    are binned together and fitted once (as the earlier evaluation, plus drift correction).
+    """
+    import xarray as xr
+    hw = halfwidth or cfg.get("qz_halfwidth", 0.04)
+    ref = tuple(cfg.get("strain_ref_ps", (-20, -2)))
+    cache = Path(cfg["proposal_root"]) / proposal.key / "profiles" if cfg.get("profile_cache", True) else None
+    per = []
+    for s in sorted(int(x) for x in scans):
+        L = load_profiles(proposal, [s], delay_tol_ps, cache_dir=cache, overrides=overrides)
+        if L is None:
+            continue
+        sp = L["spice"]
+        dl = L["delay"] + ((sp.get("offsets") or {}).get("delay") or 0.0) + (delay_offset or 0.0)
+        per.append({"scan": s, "delay": dl, "prof": L["prof"], "qz": L["qz"], "colp": L["colp"],
+                    "qy": L["qy"], "dropped": L["dropped"]})
+    if not per:
+        return None
+    qg = per[0]["qz"]
+    if qz_center is not None and not (np.nanmin(qg) <= qz_center <= np.nanmax(qg)):
+        return None
+    # pre-t0 peak position per scan
+    for d in per:
+        pre = (d["delay"] >= ref[0]) & (d["delay"] <= ref[1])
+        d["q0"] = np.nan
+        if pre.sum() >= min_frames:
+            with np.errstate(all="ignore"):
+                m = np.nanmean(d["prof"][pre], axis=0)
+            win = (np.abs(d["qz"] - (qz_center if qz_center is not None else d["qz"][np.nanargmax(m)])) <= 2 * hw) & np.isfinite(m)
+            if win.any():
+                qw = d["qz"][win][np.nanargmax(m[win])]
+                f = fit_profiles(d["qz"], m[None, :], qw, hw)
+                d["q0"] = f["center"][0] if np.isfinite(f["center"][0]) else f["com"][0]
+    q0s = np.array([d["q0"] for d in per])
+    q_ref = np.nanmean(q0s) if np.isfinite(q0s).any() else np.nan
+    # shift and merge
+    D, P, C = [], [], []
+    for d in per:
+        shift = (q_ref - d["q0"]) if (drift_correction and np.isfinite(d["q0"])) else 0.0
+        d["shift"] = shift
+        P.append(np.array([np.interp(qg, d["qz"] + shift, x, left=np.nan, right=np.nan) for x in d["prof"]]))
+        D.append(d["delay"])
+        C.append(d["colp"])
+    D, P = np.concatenate(D), np.concatenate(P)
+    same_cols = len({c.shape[1] for c in C}) == 1
+    C = np.concatenate(C) if same_cols else None
+    qy = per[0]["qy"]
+    edges = _bin_edges(delay_bins or cfg.get("delay_bins_ps"))
+    idx, ok = _bin(D, edges)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    counts = np.bincount(idx[ok], minlength=len(edges) - 1)
+    keep = np.where(counts >= min_frames)[0]
+    if keep.size == 0:
+        return None
+    Pb = np.full((keep.size, qg.size), np.nan)
+    Cb = np.full((keep.size, qy.size), np.nan) if C is not None else None
+    with np.errstate(all="ignore"):
+        for j, b in enumerate(keep):
+            fr = np.where(ok & (idx == b))[0]
+            Pb[j] = np.nanmean(P[fr], axis=0)
+            if Cb is not None:
+                Cb[j] = np.nanmean(C[fr], axis=0)
+    bd = centers[keep]
+    mean = np.nanmean(Pb, axis=0)
+    search = ((np.abs(qg - qz_center) <= 2 * hw) if qz_center is not None else np.ones(qg.size, bool)) & np.isfinite(mean)
+    if not search.any():
+        return None
+    qw = qg[search][np.nanargmax(mean[search])]
+    fit = fit_profiles(qg, Pb, qw, hw)
+    if Cb is not None:
+        w = np.clip(Cb - np.nanmin(Cb, axis=1, keepdims=True), 0, None)
+        wsum = np.nansum(w, axis=1)
+        qy_com = np.nansum(w * qy, axis=1) / np.where(wsum > 0, wsum, np.nan)
+    else:
+        qy_com = np.full(bd.size, np.nan)
+    rel = np.linspace(-2 * hw, 2 * hw, 81)
+    Pw = np.array([np.interp(qw + rel, qg, x, left=np.nan, right=np.nan) for x in Pb])
+    with np.errstate(all="ignore"):
+        ds = xr.Dataset({k: ("delay", fit[k]) for k in ("center", "center_err", "sigma", "amplitude", "com",
+                                                         "intensity", "stdev")},
+                        coords={"delay": bd, "q_rel": rel})
+    ds["qy_com"] = ("delay", qy_com)
+    ds["frames"] = ("delay", counts[keep].astype(float))
+    ds["profile"] = (("delay", "q_rel"), Pw)
+    ds["center_err"] = ds["center_err"].where(np.isfinite(ds["center_err"]))
+    # every scan on its own (centre of mass in the window, relative to its own pre-t0) for diagnostics
+    sl = []
+    for d in per:
+        i2, ok2 = _bin(d["delay"], edges)
+        cur = np.full(bd.size, np.nan)
+        win = np.abs(d["qz"] - (qw - d["shift"])) <= hw
+        for j, b in enumerate(keep):
+            fr = np.where(ok2 & (i2 == b))[0]
+            if fr.size:
+                with np.errstate(all="ignore"):
+                    y = np.nanmean(d["prof"][fr][:, win], axis=0)
+                yy = np.clip(y - np.nanmin(y), 0, None)
+                if np.nansum(yy) > 0:
+                    cur[j] = np.nansum(yy * d["qz"][win]) / np.nansum(yy)
+        r0 = np.nanmean(cur[(bd >= ref[0]) & (bd <= ref[1])])
+        sl.append(-(cur - r0) / r0 * 1e3)
+    ds["strain_loop"] = (("loop", "delay"), np.array(sl))
+    ds = ds.assign_coords(loop=np.arange(len(per)), loop_scan=("loop", [d["scan"] for d in per]))
+    ds["q_window"] = qw
+    ds["strain"] = strain(ds, ref=ref)
+    ds["strain_com"] = strain(ds, ref=ref, key="com")
+    if full_profiles:
+        ds["intensity_full"] = (("delay", "qz"), Pb)
+        ds = ds.assign_coords(qz=qg)
+    ds.attrs.update({"loops": [f"{d['scan']}: q0={d['q0']:.4f}" for d in per], "q_ref": float(q_ref),
+                     "q_window": float(qw), "drift_corrected": bool(drift_correction), "loop_mode": "merge",
+                     "dropped_frames": int(sum(d["dropped"] for d in per)),
+                     "drift_permille": float((np.nanmax(q0s) - np.nanmin(q0s)) / q_ref * 1e3)
+                     if np.isfinite(q0s).sum() > 1 else 0.0})
+    return ds
+
+
 def analyze_curve(proposal, scans, cfg, qz_center=None, qx_qy_zero=True, drift_correction=True,
-                  min_frames=5, delay_tol_ps=3.0):
+                  min_frames=5, delay_tol_ps=3.0, halfwidth=None, delay_offset=0.0,
+                  delay_bins=None, full_profiles=False, loop_mode=None, overrides=None):
     """
     One curve (e.g. one fluence) from several scans: the scans are split into
     loops (repetitions), every loop is binned and fitted on its own, shifted
     to the common pre-t0 peak position (drift correction) and the loops are
     averaged (weights = frames). Returns an xarray.Dataset over delay.
+
+    loop_mode: "consecutive" (Okt 2025: consecutive scan numbers = one loop over
+    several delay ranges), "scan" (every scan fitted on its own) or "merge" (Feb 2025:
+    drift-aligned profiles of all scans binned together, see _merged_curve);
+    default from cfg["loop_mode"]. halfwidth: fit window +- around the peak
+    (default cfg["qz_halfwidth"]). full_profiles: also return the binned profiles
+    over the whole detector range (variable "intensity_full", dims delay x qz,
+    drift-corrected), e.g. for the export in the format of the earlier evaluation.
     """
     import xarray as xr
-    loops = [l for l in (_loop_curve(proposal, lp, cfg, qz_center, qx_qy_zero, min_frames, delay_tol_ps)
-                         for lp in split_loops(scans)) if l is not None]
+    mode = loop_mode or cfg.get("loop_mode", "consecutive")
+    if mode == "merge":
+        return _merged_curve(proposal, scans, cfg, qz_center, drift_correction, min_frames, delay_tol_ps,
+                             halfwidth, delay_offset, delay_bins, full_profiles, overrides)
+    groups = [[int(s)] for s in sorted(scans)] if mode == "scan" else split_loops(scans)
+    loops = [l for l in (_loop_curve(proposal, lp, cfg, qz_center, qx_qy_zero, min_frames, delay_tol_ps,
+                                     halfwidth, delay_offset, delay_bins, overrides)
+                         for lp in groups) if l is not None]
     if not loops:
         return None
     q0s = np.array([l["q0"] for l in loops])
     q_ref = np.nanmean(q0s) if np.isfinite(q0s).any() else np.nan
     allb = np.unique(np.concatenate([l["delay"] for l in loops]))
-    acc = {k: np.zeros(allb.size) for k in ("w", "c", "s", "a", "m", "qy", "inv", "f")}
+    acc = {k: np.zeros(allb.size) for k in ("w", "c", "s", "a", "m", "qy", "inv", "f", "i", "sd")}
     prof = np.zeros((allb.size, loops[0]["profile"].shape[1]))
 
     def onto(x, y, valid):
@@ -1333,6 +1603,8 @@ def analyze_curve(proposal, scans, cfg, qz_center=None, qx_qy_zero=True, drift_c
         acc["a"] += np.nan_to_num(onto(l["delay"], l["amplitude"], good) * w)
         acc["m"] += np.nan_to_num(onto(l["delay"], l["com"] + shift, good & np.isfinite(l["com"])) * w)
         acc["qy"] += np.nan_to_num(onto(l["delay"], l["qy_com"], good & np.isfinite(l["qy_com"])) * w)
+        acc["i"] += np.nan_to_num(onto(l["delay"], l["intensity"], good & np.isfinite(l["intensity"])) * w)
+        acc["sd"] += np.nan_to_num(onto(l["delay"], l["stdev"], good & np.isfinite(l["stdev"])) * w)
         acc["inv"] += np.nan_to_num(onto(l["delay"], 1 / l["center_err"] ** 2, good))
         acc["f"] += w
         for k in range(prof.shape[1]):
@@ -1344,6 +1616,7 @@ def analyze_curve(proposal, scans, cfg, qz_center=None, qx_qy_zero=True, drift_c
             {"center": ("delay", acc["c"] / W), "center_err": ("delay", 1 / np.sqrt(acc["inv"])),
              "sigma": ("delay", acc["s"] / W), "amplitude": ("delay", acc["a"] / W),
              "com": ("delay", acc["m"] / W), "qy_com": ("delay", acc["qy"] / W),
+             "intensity": ("delay", acc["i"] / W), "stdev": ("delay", acc["sd"] / W),
              "frames": ("delay", acc["f"]),
              "profile": (("delay", "q_rel"), prof / np.where(acc["f"] > 0, acc["f"], np.nan)[:, None])},
             coords={"delay": allb, "q_rel": loops[0]["q_rel"]})
@@ -1360,8 +1633,26 @@ def analyze_curve(proposal, scans, cfg, qz_center=None, qx_qy_zero=True, drift_c
     shift0 = (q_ref - l0["q0"]) if (drift_correction and np.isfinite(l0["q0"])) else 0.0
     ds["q_window"] = l0["q_window"] + shift0     # absolute q of q_rel = 0 (drift corrected)
     ds["strain"] = strain(ds, ref=tuple(cfg.get("strain_ref_ps", (-20, -2))))
+    ds["strain_com"] = strain(ds, ref=tuple(cfg.get("strain_ref_ps", (-20, -2))), key="com")
+    if full_profiles:
+        qg = loops[0]["qz"]
+        full, fw = np.zeros((allb.size, qg.size)), np.zeros((allb.size, qg.size))
+        for l in loops:
+            shift = (q_ref - l["q0"]) if (drift_correction and np.isfinite(l["q0"])) else 0.0
+            good = np.isfinite(l["center"])
+            w = float(np.mean(l["frames"][good])) if good.any() else 0.0
+            # shift the profile by the drift (q -> q + shift) and put it on the common q grid
+            Pq = np.array([np.interp(qg, l["qz"] + shift, p, left=np.nan, right=np.nan) for p in l["P_full"]])
+            for k in range(qg.size):
+                v = onto(l["delay"], Pq[:, k], np.isfinite(Pq[:, k]))
+                full[:, k] += np.nan_to_num(v * w)
+                fw[:, k] += np.where(np.isfinite(v), w, 0.0)
+        with np.errstate(all="ignore"):
+            ds["intensity_full"] = (("delay", "qz"), full / np.where(fw > 0, fw, np.nan))
+        ds = ds.assign_coords(qz=qg)
     drift = [f"{l['scans'][0]}-{l['scans'][-1]}: q0={l['q0']:.4f}" for l in loops]
     ds.attrs.update({"loops": drift, "q_ref": float(q_ref), "q_window": float(loops[0]["q_window"]),
+                     "drift_corrected": bool(drift_correction),
                      "dropped_frames": int(sum(l["dropped"] for l in loops)),
                      "drift_permille": float((np.nanmax(q0s) - np.nanmin(q0s)) / q_ref * 1e3)
                      if np.isfinite(q0s).sum() > 1 else 0.0})
@@ -1477,6 +1768,184 @@ def suggest_theta_offset(run):
 
 
 # ---------------------------------------------------------------------------
+# sample sets (Feb 2025): fixed scan lists per sample, several peaks per scan group
+#
+# cfg["sets"][<set>] = {"groups": {<group>: [scans]},           e.g. "Au": scans at the Au angle
+#                       "peaks": {<label>: {"element", "group", "qz", "halfwidth"}},
+#                       "rsm_scans": [...], "delay_offset": 0.0, "paper": true}
+
+def set_scans(cfg, name):
+    """(delay scans, angle scans) of a sample set."""
+    st = cfg["sets"][name]
+    return sorted({int(s) for v in st["groups"].values() for s in v}), [int(s) for s in st.get("rsm_scans", [])]
+
+
+def set_overview(cfg, name, proposal=None):
+    """Table: scans per group, how many are converted, peaks fitted in the group."""
+    import pandas as pd
+    st = cfg["sets"][name]
+    have = set(proposal.all()) if proposal is not None else set()
+    rows = []
+    for g, scans in st["groups"].items():
+        rows.append({"Gruppe": g, "Scans": len(scans), "umgewandelt": sum(str(s) in have for s in scans),
+                     "erster": min(scans), "letzter": max(scans),
+                     "Peaks": ", ".join(l for l, pk in st["peaks"].items() if pk["group"] == g) or "-"})
+    return pd.DataFrame(rows).set_index("Gruppe")
+
+
+def analyze_set(proposal, cfg, name, peaks=None, **kw):
+    """
+    All peaks of one sample set -> {label: Dataset over delay} (see analyze_curve).
+    Label "<element>@<group>", e.g. "Ni@Au" = Ni peak in the scans taken at the Au angle.
+    Options as analyze_curve (drift_correction, min_frames, delay_tol_ps, full_profiles, ...).
+    """
+    st = cfg["sets"][name]
+    out, log = {}, []
+    have = set(proposal.all())
+    for label, pk in st["peaks"].items():
+        if peaks and label not in peaks:
+            continue
+        group = st["groups"][pk["group"]]
+        scans = [s for s in group if str(int(s)) in have]
+        if not scans:
+            print(f"{name} {label}: noch keiner der {len(group)} Scans umgewandelt", flush=True)
+            continue
+        ov = {int(s): scan_geometry(cfg, s, name, pk["group"]) for s in scans}
+        ds = analyze_curve(proposal, scans, cfg, qz_center=pk["qz"], halfwidth=pk.get("halfwidth"),
+                           delay_offset=st.get("delay_offset", 0.0), delay_bins=st.get("delay_bins_ps"),
+                           overrides={s: o for s, o in ov.items() if o}, **kw)
+        if ds is None:
+            print(f"{name} {label}: Peak nicht im Messbereich dieser Scans", flush=True)
+            continue
+        ds.attrs.update({"set": name, "peak": pk["element"], "group": pk["group"], "label": label,
+                         "scans_used": len(scans), "scans_total": len(group)})
+        out[label] = ds
+        mx = float(np.nanmax(np.abs(ds["strain"]))) if np.isfinite(ds["strain"]).any() else np.nan
+        log.append({"Peak": label, "Scans": f"{len(scans)}/{len(group)}", "Wiederholungen": len(ds.attrs["loops"]),
+                    "Drift ‰": round(ds.attrs["drift_permille"], 2), "verworfene Frames": ds.attrs["dropped_frames"],
+                    "q0 (1/Å)": round(ds.attrs["q_ref"], 4), "max |Dehnung| ‰": round(mx, 2)})
+        print(f"{name} {label}: {len(scans)}/{len(group)} Scans, Drift {ds.attrs['drift_permille']:.2f} ‰, "
+              f"{ds.attrs['dropped_frames']} Frames verworfen, max |Dehnung| {mx:.2f} ‰", flush=True)
+    if log:
+        import pandas as pd
+        out["_log"] = pd.DataFrame(log).set_index("Peak")
+    return out
+
+
+def _rel(x, delay, flip=False):
+    """Relative change in % w.r.t. the mean over delay < 0 (as in the earlier evaluation)."""
+    ref = np.nanmean(x[delay < 0])
+    r = (x / ref - 1) * 100
+    return -r if flip else r
+
+
+def export_set(results, cfg, name, outdir):
+    """
+    Writes the results of analyze_set(..., full_profiles=True) in the format of the earlier
+    evaluation (Eval_by_Project/3. NiAu, data_export/<set>_<group>/), so that the paper scripts
+    (e.g. Analysis/strain_extraction.py with UXRD_DATA=<outdir>) read them unchanged:
+      binned_intensity_numpy_style.dat   q_z profiles per delay bin (drift-corrected)
+      results_export_numpy_style.dat / results_export_pandas_style.dat
+                                         relative changes in % vs. delay < 0 (center, com: strain)
+      femto_nx5d_<label>.nc              everything from analyze_curve
+    Returns the list of folders.
+    """
+    outdir = Path(outdir)
+    labels = [l for l in results if not l.startswith("_")]
+    folders = []
+    for g in dict.fromkeys(results[l].attrs["group"] for l in labels):
+        mine = [l for l in labels if results[l].attrs["group"] == g]
+        main = next((l for l in mine if results[l].attrs["peak"] == g), mine[0])
+        d = outdir / f"{name}_{g}"
+        d.mkdir(parents=True, exist_ok=True)
+        ds = results[main]
+        head = [f"# scans: {cfg['sets'][name]['groups'][g]}", f"# Sample: {name}",
+                f"# femto_nx5d {ds.attrs.get('label')}: drift-corrected={ds.attrs.get('drift_corrected', True)}"]
+        if "intensity_full" in ds:
+            I, q, t = ds["intensity_full"].values, ds["qz"].values, ds["delay"].values
+            keep = np.isfinite(I).any(axis=1)
+            with open(d / "binned_intensity_numpy_style.dat", "w") as f:
+                f.write("Binned intensity data in fixed-point format (four decimal digits).\n")
+                f.write("First column: qz values, subsequent columns: intensity values at specified xraydelay.\n")
+                f.write("qz/xraydelay " + " ".join(f"{x:.4f}" for x in t[keep]) + "\n")
+                np.savetxt(f, np.column_stack([q, I[keep].T]), fmt="%.4f")
+        cols = ["fit_center", "fit_width", "fit_amplitude", "com", "intensity", "stdev"]
+        src = {"fit_center": ("center", True), "fit_width": ("sigma", False), "fit_amplitude": ("amplitude", False),
+               "com": ("com", True), "intensity": ("intensity", False), "stdev": ("stdev", False)}
+        t = ds["delay"].values
+        peaks = [results[l].attrs["peak"] for l in mine]
+        table = {c: [] for c in cols}
+        for l in mine:
+            r = results[l].reindex(delay=t)
+            for c in cols:
+                v, flip = src[c]
+                table[c].append(_rel(r[v].values, t, flip))
+        with open(d / "results_export_numpy_style.dat", "w") as f:
+            f.write("\n".join(head[:2]) + "\n# xraydelay " +
+                    " ".join(f"{c}_{p}" for c in cols for p in peaks) + "\n")
+            np.savetxt(f, np.column_stack([t] + [a for c in cols for a in table[c]]), fmt="%.6f")
+        with open(d / "results_export_pandas_style.dat", "w") as f:
+            f.write("\n".join(head[:2]) + "\n#\n")
+            f.write("peak xraydelay com intensity stdev fit_center fit_width fit_amplitude\n")
+            order = ["com", "intensity", "stdev", "fit_center", "fit_width", "fit_amplitude"]
+            for i, p in enumerate(peaks):
+                for j, x in enumerate(t):
+                    f.write(p + " " + " ".join(f"{v:.6f}" for v in [x] + [table[c][i][j] for c in order]) + "\n")
+        for l in mine:
+            r = results[l].copy()
+            r.attrs = {k: (json.dumps(v) if isinstance(v, (list, dict)) else int(v) if isinstance(v, bool) else v)
+                       for k, v in r.attrs.items()}
+            r.to_netcdf(d / f"femto_nx5d_{l.replace('@', '_at_')}.nc")
+        folders.append(d)
+    return folders
+
+
+def rsm_map(run, bins=(300, 250), smooth=1.0):
+    """
+    Static RSM of an angle scan directly from the scattering angles (no xraydc):
+    every frame/detector pixel -> (q_x, q_z), intensity averaged over the out-of-plane pixels,
+    binned on a regular grid. Works for both geometries (spice "geometry").
+    Returns (DataArray (qz, qx), peak {"qx", "qz"}).
+    """
+    import xarray as xr
+    from scipy.ndimage import gaussian_filter
+    spice = {k: v.data() for k, v in run.spice.data.items()}
+    d = run.raw.compute()
+    ei, off = spice["exp_info"], spice.get("offsets") or {}
+    k = 2 * np.pi / (12398.42 / ei["beamEnergy"])
+    img = d["images"].values
+    _, row_c = ei["imageCenter"]
+    px = ei["imageChannelSize"][1]
+    d2 = np.degrees(np.arctan((np.arange(img.shape[2]) - row_c) * px / ei["imageDistance"]))
+    th = d["theta"].values + off.get("theta", 0.0)
+    tth = d["ttheta"].values + off.get("ttheta", 0.0)
+    with np.errstate(all="ignore"):
+        I = np.nanmean(img, axis=1)                                   # (frames, in-plane)
+    ain = np.radians(th)[:, None] * np.ones_like(d2)[None, :]
+    geo = spice.get("geometry") or {}
+    if geo.get("mode", "symmetric") == "fixed_exit" and geo.get("two_theta_lab") is not None:
+        # angle scan with the detector fixed in the lab: a_out = 2theta(pixel) - a_in
+        aout = np.radians(geo["two_theta_lab"] - d2[None, :] - th[:, None])
+    elif geo.get("mode", "symmetric") == "fixed_exit":
+        aout = np.radians(tth[:, None] - d2[None, :])
+    else:                                                             # detector 2theta - sample theta
+        aout = np.radians(tth[:, None] - d2[None, :] - th[:, None])
+    qx = k * (np.cos(aout) - np.cos(ain))
+    qz = k * (np.sin(ain) + np.sin(aout))
+    ok = np.isfinite(I)
+    H, ez, ex = np.histogram2d(qz[ok], qx[ok], bins=bins, weights=I[ok])
+    N, _, _ = np.histogram2d(qz[ok], qx[ok], bins=(ez, ex))
+    with np.errstate(all="ignore"):
+        M = np.where(N > 0, H / N, np.nan)
+    m = xr.DataArray(M, dims=("qz", "qx"), coords={"qz": 0.5 * (ez[1:] + ez[:-1]), "qx": 0.5 * (ex[1:] + ex[:-1])},
+                     name="intensity", attrs={"scan": run.key})
+    sm = gaussian_filter(np.nan_to_num(M), smooth)
+    i, j = np.unravel_index(int(np.argmax(sm)), sm.shape)
+    _release(run)
+    return m, {"qx": float(m.qx[j]), "qz": float(m.qz[i])}
+
+
+# ---------------------------------------------------------------------------
 # plots
 
 def plot_rsm(cooked, peak=None, ax=None):
@@ -1544,8 +2013,13 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description="FemtoMAX -> nx5d")
     ap.add_argument("--config", default="femtomax_config.json")
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "setup-feb":      # own argument parser
+        from . import feb_setup
+        return feb_setup.main(sys.argv[2:])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("catalog", help="(re)build the scan catalog")
+    sub.add_parser("setup-feb", help="Config + Notebooks für Feb 2025 (siehe femto-nx5d setup-feb -h)")
     ing = sub.add_parser("ingest", help="convert scans")
     ing.add_argument("scans", nargs="*", type=int)
     ing.add_argument("--sample")
@@ -1568,7 +2042,7 @@ def main():
             if a.series:
                 if not a.sample:
                     ap.error("--series needs --sample")
-                scans = ingest_order(df, a.sample, a.series)
+                scans = ingest_order(df, a.sample, a.series, cfg)
             else:
                 if a.sample:
                     df = df[df["sample"] == a.sample]
