@@ -64,6 +64,12 @@ Ausgewertet wird mit `loop_mode: merge`:
 2. Die Profile werden verschoben.
 3. Danach werden alle Scans zusammen gebinnt und gefittet.
 
+**Alles fürs Paper in einem Schritt:** `python -m femto_nx5d.pipeline paper` (bzw. `fmx.paper_export(cfg)`):
+- Auswertung aller Paper-Sets mit q_x = q_y = 0 (|q| statt q_z-Komponente, `qx_qy_zero`)
+- Export im alten Format
+- RSMs mit Peaklage in q_x und Kippung (`results/rsm/`)
+- `paper_summary.json` und die zip-Datei zum Herunterladen
+
 `pipeline.export_set` schreibt die Ergebnisse im Format der bisherigen `data_export`-Ordner
 (`binned_intensity_numpy_style.dat`, `results_export_*.dat`).
 

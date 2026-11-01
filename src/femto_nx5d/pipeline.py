@@ -1440,6 +1440,24 @@ def _find_peak(qg, prof, centre, hw, factor=1.5):
     return float(qg[sel[i]])
 
 
+def to_q_abs(cfg, proposal_key, scan, qz, spice):
+    """
+    q_x = q_y = 0 for the Feb 2025 geometry ("fixed_exit"): the profiles are computed on the q_z
+    component k (sin a_in + sin a_out) of every detector row; with cfg["qx_qy_zero"] (default True)
+    this is replaced by |q| = 2k sin((a_in + a_out)/2), i.e. the whole scattering vector is taken as
+    q_z (as in the 'q_x = q_y = 0' mode of the symmetric geometry). a_in from the scan file,
+    a_out from the q_z component. The out-of-plane direction (q_y) is integrated in the profiles.
+    """
+    if (spice.get("geometry") or {}).get("mode") != "fixed_exit" or not cfg.get("qx_qy_zero", True):
+        return qz
+    k = 2 * np.pi / (12398.42 / spice["exp_info"]["beamEnergy"])
+    with h5py.File(scan_file(cfg, proposal_key, scan), "r") as f:
+        th = float(np.nanmean(f["instrument/motors/theta"][()]))
+    ai = np.radians(th + ((spice.get("offsets") or {}).get("theta") or 0.0))
+    ao = np.arcsin(np.clip(qz / k - np.sin(ai), -1, 1))
+    return 2 * k * np.sin((ai + ao) / 2)
+
+
 def _xcorr_shift(qg, ref, y, mask, max_shift, n=201):
     """
     Shift s (1/A) that moves profile y onto ref: y(q - s) ~ ref(q), by maximising the normalised
@@ -1492,7 +1510,8 @@ def _merged_curve(proposal, scans, cfg, qz_center=None, drift_correction=True, m
             continue
         sp = L["spice"]
         dl = L["delay"] + ((sp.get("offsets") or {}).get("delay") or 0.0) + (delay_offset or 0.0)
-        per.append({"scan": s, "delay": dl, "prof": L["prof"], "qz": L["qz"], "colp": L["colp"],
+        qz_s = to_q_abs(cfg, proposal.key, s, L["qz"], sp)
+        per.append({"scan": s, "delay": dl, "prof": L["prof"], "qz": qz_s, "colp": L["colp"],
                     "qy": L["qy"], "dropped": L["dropped"],
                     "k": 2 * np.pi / (12398.42 / sp["exp_info"]["beamEnergy"])})
     if not per:
@@ -1626,6 +1645,8 @@ def _merged_curve(proposal, scans, cfg, qz_center=None, drift_correction=True, m
                      "scan_shift_angle": json.dumps({str(d["scan"]): d["shift"] / dq_dangle for d in per}),
                      "drift_flagged": json.dumps([int(x) for x in flagged]),
                      "drift_source": "fixed" if fixed_shift_rel is not None else "xcorr",
+                     "q_axis": "|q| (qx = qy = 0)" if cfg.get("qx_qy_zero", True) and
+                     (per and (cfg.get("geometry") == "fixed_exit")) else "qz component",
                      "q_window": float(qw), "drift_corrected": bool(drift_correction), "loop_mode": "merge",
                      "dropped_frames": int(sum(d["dropped"] for d in per)),
                      "drift_permille": float((np.nanmax(q0s) - np.nanmin(q0s)) / q_ref * 1e3)
@@ -2028,6 +2049,94 @@ def pack_results(cfg, out=None):
     return out
 
 
+PAPER_OPTS = dict(drift_correction=True, min_frames=3, delay_tol_ps=3.0, full_profiles=True)
+
+
+def rsm_peaks(m, cfg, name, window=0.06):
+    """Layer peaks in an RSM (from rsm_map): position (qx, qz) of the maximum near every expected q_z of the
+    set, and the tilt atan(qx/qz) that would bring it to qx = 0 (sample/detector alignment check)."""
+    out = []
+    for label, pk in cfg["sets"][name]["peaks"].items():
+        if "@" in label:
+            continue
+        sub = m.sel(qz=slice(pk["qz"] - window, pk["qz"] + window))
+        if sub.size == 0 or not np.isfinite(sub.values).any():
+            continue
+        v = np.nan_to_num(sub.values)
+        i, j = np.unravel_index(int(np.argmax(v)), v.shape)
+        # centroid of the intensity above half maximum around the maximum (sub-pixel position)
+        i0, i1, j0, j1 = max(i - 4, 0), i + 5, max(j - 4, 0), j + 5
+        w = v[i0:i1, j0:j1]
+        w = np.where(w >= 0.5 * v[i, j], w, 0.0)
+        qx = float((w.sum(axis=0) * sub.qx.values[j0:j1]).sum() / w.sum())
+        qz = float((w.sum(axis=1) * sub.qz.values[i0:i1]).sum() / w.sum())
+        out.append({"peak": label, "qx": qx, "qz": qz, "tilt_deg": float(np.degrees(np.arctan2(qx, qz)))})
+    return out
+
+
+def paper_export(cfg, sets=None, jobs=4, rsm=True):
+    """
+    Everything for the paper in one go (Feb 2025 sample sets): analysis of every set with "paper": true
+    (or `sets`) with PAPER_OPTS and export in the format of the earlier evaluation
+    (results/paper_export), static RSMs of every set (results/rsm/<set>_<scan>.npz + rsm_summary.tsv,
+    missing RSM scans are converted first), results/paper_summary.json, and finally the zip (pack_results).
+    """
+    import xarray as xr  # noqa: F401  (needed by rsm_map)
+    base = Path(cfg["_config_dir"])
+    res_dir = base / cfg.get("results_dir", "results")
+    names = sets or [n for n, st in cfg["sets"].items() if st.get("paper")]
+    cat = catalog(cfg)
+    repo = repository(cfg)
+    prop = open_proposal(repo, cfg["proposal"])
+    if prop is None:
+        raise RuntimeError("noch nichts umgewandelt -> erst ingest")
+    summary = {"femto_nx5d": __import__("femto_nx5d").__version__, "time": time.strftime("%Y-%m-%d %H:%M"),
+               "options": PAPER_OPTS, "qx_qy_zero": cfg.get("qx_qy_zero", True),
+               "delay_bins_ps": cfg.get("delay_bins_ps"), "sets": {}, "rsm": {}}
+    have = set(prop.all())
+    for name in names:
+        print(f"== {name}", flush=True)
+        st = cfg["sets"][name]
+        missing = [s for g in st["groups"].values() for s in g if str(s) not in have and s in cat.index]
+        r = analyze_set(prop, cfg, name, **PAPER_OPTS)
+        labels = [l for l in r if not l.startswith("_")]
+        if labels:
+            export_set(r, cfg, name, res_dir / "paper_export")
+        summary["sets"][name] = {
+            "not_converted": missing,
+            "peaks": {l: {k: (r[l].attrs.get(k) if not isinstance(r[l].attrs.get(k), (np.floating, np.integer))
+                              else float(r[l].attrs.get(k)))
+                          for k in ("q_ref", "drift_permille", "dropped_frames", "drift_flagged", "q_axis",
+                                    "scans_used", "scans_total")} for l in labels}}
+    if rsm:
+        out = res_dir / "rsm"
+        out.mkdir(parents=True, exist_ok=True)
+        rows = ["set\tscan\tpeak\tqx (1/A)\tqz (1/A)\ttilt (deg)"]
+        for name in names:
+            for s in cfg["sets"][name].get("rsm_scans", [])[:1]:
+                if str(s) not in set(prop.all()):
+                    if s not in cat.index:
+                        print(f"{name}: RSM-Scan {s} nicht im Katalog")
+                        continue
+                    print(f"{name}: RSM-Scan {s} wird umgewandelt ...", flush=True)
+                    ingest_scan(s, cfg)
+                    prop = open_proposal(repository(cfg), cfg["proposal"])
+                m, pk = rsm_map(prop.scan(key=str(s)))
+                peaks = rsm_peaks(m, cfg, name)
+                np.savez(out / f"{name}_{s}.npz", I=m.values, qx=m.qx.values, qz=m.qz.values,
+                         peaks=json.dumps(peaks))
+                summary["rsm"][name] = {"scan": int(s), "peaks": peaks}
+                for p_ in peaks:
+                    rows.append(f"{name}\t{s}\t{p_['peak']}\t{p_['qx']:.4f}\t{p_['qz']:.4f}\t{p_['tilt_deg']:.3f}")
+                print(f"{name}: RSM {s}: " + ", ".join(f"{p_['peak']} qx={p_['qx']:+.4f} (Kippung {p_['tilt_deg']:+.2f}°)"
+                                                        for p_ in peaks), flush=True)
+            if not cfg["sets"][name].get("rsm_scans"):
+                print(f"{name}: kein RSM-Scan in der Config (which_sample.csv)")
+        (out / "rsm_summary.tsv").write_text("\n".join(rows) + "\n")
+    (res_dir / "paper_summary.json").write_text(json.dumps(summary, indent=1, default=str))
+    return pack_results(cfg)
+
+
 def rsm_map(run, bins=(300, 250), smooth=1.0):
     """
     Static RSM of an angle scan directly from the scattering angles (no xraydc):
@@ -2148,6 +2257,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("catalog", help="(re)build the scan catalog")
     sub.add_parser("pack", help="results/ + config + notebooks in one zip file (for download)")
+    pp = sub.add_parser("paper", help="Feb 2025: analysis of all paper sets, RSMs, summary and zip in one go")
+    pp.add_argument("--sets", nargs="*", help="only these sample sets")
+    pp.add_argument("--no-rsm", action="store_true")
     sub.add_parser("setup-feb", help="Config + Notebooks für Feb 2025 (siehe femto-nx5d setup-feb -h)")
     ing = sub.add_parser("ingest", help="convert scans")
     ing.add_argument("scans", nargs="*", type=int)
@@ -2163,6 +2275,8 @@ def main():
     cfg = load_config(a.config)
     if a.cmd == "pack":
         return pack_results(cfg)
+    if a.cmd == "paper":
+        return paper_export(cfg, sets=a.sets, rsm=not a.no_rsm)
     if a.cmd == "catalog":
         df = catalog(cfg, refresh=True)
         print(df.groupby(["sample", "type"], dropna=False).size())

@@ -340,9 +340,12 @@ for var in ("strain_com", "strain"):
         fig = ff.fig_sets_grid(ALL, var=var, window=w)
         ff.save(fig, f"alle_{var}_{w}", FIG)
 plt.show()""")
-    md("## 4 Herunterladen")
-    code("""# results/ + Config + Notebooks in eine zip-Datei (ohne umgewandelte Scans) -> Rechtsklick -> Download
-fmx.pack_results(cfg)""")
+    md("""## 4 Alles fürs Paper + Herunterladen
+`paper_export`: Auswertung aller Paper-Proben (q_x = q_y = 0, gebinnt, Drift-Korrektur), Export im alten Format,
+RSMs aller Proben (fehlende RSM-Scans werden umgewandelt) mit Lage der Schichtpeaks in q_x (Kippung),
+`results/paper_summary.json` und die zip-Datei -> im Dateibrowser Rechtsklick -> Download.
+Im Terminal dasselbe: `python -m femto_nx5d.pipeline paper`""")
+    code("""fmx.paper_export(cfg)""")
     md("""## 5 Paper-Skripte mit den neuen Daten
 
 ```bash

@@ -232,6 +232,8 @@ def build_config(raw, out, sets, process=None, notes=None, paper=None):
         "theta_sign": -1,
         "geometry": "fixed_exit",
         "loop_mode": "merge",
+        "qx_qy_zero": True,
+        "_qx_qy_zero_comment": "Profile über |q| statt q_z-Komponente (q_x = q_y = 0), über q_y integriert",
         "scan_types": {"xraydelay": "tRSS", "e_gon01_keta": "sRSM", "l_lwp01_energy": "fRSS"},
         "samples": {prop: {"e_gon01_x": 0.0, "beamEnergy": 8000.0, "center": {"row": 300, "col": 330},
                            "imageDistance": DIST, "theta_offset": -30.7, "ttheta_offset": 18.5}},
