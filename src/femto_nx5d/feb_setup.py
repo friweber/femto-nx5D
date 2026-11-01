@@ -207,7 +207,10 @@ def build_config(raw, out, sets, process=None, notes=None, paper=None):
             if bad:
                 set_notes.append(f"{g}: alte Geometrie von {bad} unplausibel (2θ > 1° neben der Laborgeometrie) "
                                  f"-> Gruppenwert {geometry[g]}")
-        cfg_sets[name] = {"groups": groups, "peaks": peaks, "rsm_scans": rsm_scans(raw, name, ranges),
+        builtin_rsm = (json.loads(__import__("importlib.resources", fromlist=["files"]).files("femto_nx5d")
+                                  .joinpath("data/feb2025_scan_lists.json").read_text())["sets"]
+                       .get(name, {}).get("rsm_scans"))
+        cfg_sets[name] = {"groups": groups, "peaks": peaks, "rsm_scans": builtin_rsm or rsm_scans(raw, name, ranges),
                           "geometry": geometry, "delay_offset": 0.0,
                           "paper": (wl == "400") if paper is None else paper,
                           "pump_wavelength_nm": wl, "notes": set_notes}

@@ -2074,6 +2074,57 @@ def rsm_peaks(m, cfg, name, window=0.06):
     return out
 
 
+def _builtin_rsm(name):
+    """RSM scans of the packaged scan lists (repeated RSMs of the Cu samples, see the lab book)."""
+    try:
+        from importlib import resources
+        d = json.loads(resources.files("femto_nx5d").joinpath("data/feb2025_scan_lists.json").read_text())
+        return d["sets"].get(name, {}).get("rsm_scans")
+    except Exception:
+        return None
+
+
+def detector_maps(cfg, proposal_key, scan, block=200):
+    """
+    Raw area-detector view of one converted scan (images = ROI, axes out-of-plane x in-plane):
+      angle scan: det_map (sample angle x in-plane pixel, mean over out-of-plane), det_theta,
+                  det_image (mean image at the angle of the maximum)
+      delay scan: img_pre (mean of the frames before t0), img_10ps (frames at 8-12 ps)
+    plus the in-plane pixel axis in scattering angle (tth_pixel, deg) from the spice geometry.
+    """
+    out = {}
+    with h5py.File(scan_file(cfg, proposal_key, scan), "r") as f:
+        im = f["instrument/pilatus/images"]
+        n = im.shape[0]
+        th = f["instrument/motors/theta"][()]
+        dl = f["measurement/delay"][()] if "measurement/delay" in f else np.full(n, np.nan)
+        stype = f.attrs.get("k-scan-type", "")
+        prof = np.zeros((n, im.shape[2]), np.float32)
+        acc = {"pre": [np.zeros(im.shape[1:]), 0], "10ps": [np.zeros(im.shape[1:]), 0]}
+        for i in range(0, n, block):
+            a = im[i:i + block]
+            with np.errstate(all="ignore"):
+                prof[i:i + len(a)] = np.nanmean(a, axis=1)
+            if stype != "sRSM":
+                for key, m in (("pre", dl[i:i + len(a)] < -1), ("10ps", (dl[i:i + len(a)] > 8) & (dl[i:i + len(a)] < 12))):
+                    if m.any():
+                        acc[key][0] += np.nansum(a[m], axis=0)
+                        acc[key][1] += int(m.sum())
+        if stype == "sRSM":
+            u = np.unique(np.round(th, 4))
+            det = np.array([np.nanmean(prof[np.round(th, 4) == v], axis=0) for v in u])
+            k = int(np.nanargmax(np.nanmax(det, axis=1)))
+            sel = np.where(np.round(th, 4) == u[k])[0]
+            img = np.nanmean(im[sel[0]:sel[-1] + 1], axis=0)
+            out.update(det_map=det, det_theta=u, det_image=img, det_image_theta=u[k])
+        else:
+            for key, (sm, cnt) in acc.items():
+                if cnt:
+                    out[f"img_{key}"] = sm / cnt
+    out["scan_type"] = str(stype)
+    return out
+
+
 def paper_export(cfg, sets=None, jobs=4, rsm=True):
     """
     Everything for the paper in one go (Feb 2025 sample sets): analysis of every set with "paper": true
@@ -2113,7 +2164,8 @@ def paper_export(cfg, sets=None, jobs=4, rsm=True):
         out.mkdir(parents=True, exist_ok=True)
         rows = ["set\tscan\tpeak\tqx (1/A)\tqz (1/A)\ttilt (deg)"]
         for name in names:
-            for s in cfg["sets"][name].get("rsm_scans", [])[:1]:
+            rsm_list = _builtin_rsm(name) or cfg["sets"][name].get("rsm_scans", [])
+            for s in rsm_list[:1]:
                 if str(s) not in set(prop.all()):
                     if s not in cat.index:
                         print(f"{name}: RSM-Scan {s} nicht im Katalog")
@@ -2123,8 +2175,9 @@ def paper_export(cfg, sets=None, jobs=4, rsm=True):
                     prop = open_proposal(repository(cfg), cfg["proposal"])
                 m, pk = rsm_map(prop.scan(key=str(s)))
                 peaks = rsm_peaks(m, cfg, name)
+                det = detector_maps(cfg, cfg["proposal"], s)
                 np.savez(out / f"{name}_{s}.npz", I=m.values, qx=m.qx.values, qz=m.qz.values,
-                         peaks=json.dumps(peaks))
+                         peaks=json.dumps(peaks), **det)
                 summary["rsm"][name] = {"scan": int(s), "peaks": peaks}
                 for p_ in peaks:
                     rows.append(f"{name}\t{s}\t{p_['peak']}\t{p_['qx']:.4f}\t{p_['qz']:.4f}\t{p_['tilt_deg']:.3f}")
@@ -2133,6 +2186,18 @@ def paper_export(cfg, sets=None, jobs=4, rsm=True):
             if not cfg["sets"][name].get("rsm_scans"):
                 print(f"{name}: kein RSM-Scan in der Config (which_sample.csv)")
         (out / "rsm_summary.tsv").write_text("\n".join(rows) + "\n")
+    dout = res_dir / "detector"
+    dout.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        st = cfg["sets"][name]
+        main_group = next((g for g in st["groups"] if g in ("Au", "Ni", "Cu")), None)
+        scans = [s for s in st["groups"].get(main_group, []) if str(s) in set(prop.all())]
+        if scans:
+            try:
+                np.savez(dout / f"{name}_{main_group}_{scans[0]}.npz", **detector_maps(cfg, cfg["proposal"], scans[0]))
+                print(f"{name}: Detektorbilder Scan {scans[0]}", flush=True)
+            except Exception as e:
+                print(f"{name}: Detektorbilder fehlgeschlagen: {e}")
     (res_dir / "paper_summary.json").write_text(json.dumps(summary, indent=1, default=str))
     return pack_results(cfg)
 

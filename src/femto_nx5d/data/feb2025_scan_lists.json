@@ -133,7 +133,11 @@
    ],
    "notes": [
     "125224 (Typ 3) aus der Liste von CuMgOAu10 hierher verschoben: gemessen bei x = -7.1",
-    "125225 (Typ 3) aus der Liste von CuMgOAu10 hierher verschoben: gemessen bei x = -7.1"
+    "125225 (Typ 3) aus der Liste von CuMgOAu10 hierher verschoben: gemessen bei x = -7.1",
+    "RSM: wiederholte Messung 125127 ohne Probenhalter-Artefakt (Laborbuch 16.02.2025)"
+   ],
+   "rsm_scans": [
+    125127
    ]
   },
   "CuAu100_400": {
@@ -204,7 +208,12 @@
      -49.8
     ]
    ],
-   "notes": []
+   "notes": [
+    "RSM: wiederholte Messung 125125 ohne Probenhalter-Artefakt (Laborbuch 16.02.2025)"
+   ],
+   "rsm_scans": [
+    125125
+   ]
   },
   "CuMgOAu10_400": {
    "rows": [
@@ -324,7 +333,12 @@
      -52.5
     ]
    ],
-   "notes": []
+   "notes": [
+    "RSM: wiederholte Messung 125128 ohne Probenhalter-Artefakt (Laborbuch 16.02.2025)"
+   ],
+   "rsm_scans": [
+    125128
+   ]
   },
   "CuMgOAu100_400": {
    "rows": [
@@ -414,7 +428,12 @@
      -52.5
     ]
    ],
-   "notes": []
+   "notes": [
+    "RSM: wiederholte Messung 125120 ohne Probenhalter-Artefakt (Laborbuch 16.02.2025)"
+   ],
+   "rsm_scans": [
+    125120
+   ]
   },
   "NiAu10_400": {
    "rows": [
